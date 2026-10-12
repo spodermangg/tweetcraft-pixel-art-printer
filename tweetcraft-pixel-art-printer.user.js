@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TweetCraft Pixel Art Printer
 // @namespace    https://tweetcraft.jai.vin
-// @version      1.4.0
+// @version      1.5.1
 // @description  Upload an image → auto-convert to wool colors → print pixel art like a bot (moves left→right, places blocks, fixes missed blocks per line)
 // @author       @vibecodingonsol
 // @match        https://tweetcraft.jai.vin/r/*
@@ -230,6 +230,13 @@
   }
 
   function placeBlock(x, y, z, blockId) {
+    const blockName = getBlockName(blockId);
+    if (blockId === 0) {
+      console.log(`[PixelArt] Clearing (air) at (${x}, ${y}, ${z})`);
+    } else {
+      console.log(`[PixelArt] Placing ${blockName} (id ${blockId}) at (${x}, ${y}, ${z})`);
+    }
+
     // 1. MUST successfully send across the real WebSocket
     const sent = sendEditPacket(x, y, z, blockId);
     if (!sent) {
@@ -354,6 +361,26 @@
   const WOOL_IDS_KNOWN = [47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62];
   let woolBlockIds = [...WOOL_IDS_KNOWN];
 
+  // Active palette used for color mapping.
+  // Shape: { rgb: [[r,g,b], ...], ids: [blockId, ...], all: boolean }
+  // Index i in a grid maps to block id ids[i] and color rgb[i].
+  let activePalette = { rgb: WOOL_RGB, ids: woolBlockIds, all: false };
+
+  // Texture tinting, mirrors the game's engine.js TINT table so averaged
+  // colors match what the world actually renders.
+  const BLOCK_TINT = {
+    grass_block_top: [145, 189, 89], short_grass: [145, 189, 89], fern: [145, 189, 89],
+    tall_grass_bottom: [145, 189, 89], tall_grass_top: [145, 189, 89],
+    large_fern_bottom: [145, 189, 89], large_fern_top: [145, 189, 89],
+    spruce_leaves: [97, 153, 97], oak_leaves: [119, 171, 47], birch_leaves: [128, 167, 85],
+    water_still: [63, 118, 228], water_flow: [63, 118, 228],
+  };
+  const TEXCOLOR_KEY = 'tcpixelart.texcolor.v1';
+  // Blocks that must never be printed (unbreakable / not legitimately placeable).
+  const EXCLUDED_BLOCKS = new Set(['bedrock']);
+  let fullPalette = null;
+  let fullPalettePromise = null;
+
   function discoverWoolIds() {
     let names = null;
     const mc = targetWindow.__mc || window.__mc;
@@ -388,15 +415,160 @@
     return true;
   }
 
+  // Read full block/texture tables from the game (DEV `__mc.eng` or production WASM exports).
+  function getBlockData() {
+    const mc = targetWindow.__mc || window.__mc;
+    if (mc && mc.eng && mc.eng.blockNames && mc.eng.texNames && mc.eng.ft && mc.eng.kind) {
+      return { blockNames: mc.eng.blockNames, texNames: mc.eng.texNames, ft: mc.eng.ft, kind: mc.eng.kind };
+    }
+    if (
+      wasmExports && wasmExports.memory && wasmExports.block_names && wasmExports.tex_names &&
+      wasmExports.ft_ptr && wasmExports.kind_ptr
+    ) {
+      try {
+        const mem = wasmExports.memory;
+        const b = new Uint8Array(mem.buffer);
+        const readC = (ptr) => {
+          let q = ptr;
+          while (b[q]) q++;
+          return new TextDecoder().decode(b.subarray(ptr, q));
+        };
+        return {
+          blockNames: readC(wasmExports.block_names()).split('\n'),
+          texNames: readC(wasmExports.tex_names()).split('\n'),
+          kind: new Uint8Array(mem.buffer, wasmExports.kind_ptr(), 256).slice(),
+          ft: new Uint8Array(mem.buffer, wasmExports.ft_ptr(), 256 * 6).slice(),
+        };
+      } catch (e) {
+        console.warn('[PixelArt] Failed reading block tables from WASM:', e);
+      }
+    }
+    return null;
+  }
+
+  // Cached id → block name lookup for logging.
+  let cachedBlockNames = null;
+  function getBlockName(id) {
+    if (!cachedBlockNames) {
+      const d = getBlockData();
+      if (d && d.blockNames) cachedBlockNames = d.blockNames;
+    }
+    if (cachedBlockNames) return cachedBlockNames[id] || `#${id}`;
+    return `#${id}`;
+  }
+
+  // Never build with forbidden blocks; substitute a safe equivalent instead.
+  const BLOCK_SUBSTITUTES = { 12: 34 }; // Bedrock → Block of Coal
+  function sanitizePalette(pal) {
+    if (!pal || !pal.ids) return pal;
+    let changed = false;
+    const ids = pal.ids.map((id) => {
+      if (BLOCK_SUBSTITUTES[id] != null) { changed = true; return BLOCK_SUBSTITUTES[id]; }
+      return id;
+    });
+    return changed ? { rgb: pal.rgb, ids, all: pal.all } : pal;
+  }
+
+  function loadTexImage(name) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error('could not load ' + name));
+      img.src = `/assets/block/${name}.png`;
+    });
+  }
+
+  async function averageTextureColor(name, cache) {
+    if (cache[name]) return cache[name];
+    const img = await loadTexImage(name);
+    const c = document.createElement('canvas');
+    c.width = 16;
+    c.height = 16;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.clearRect(0, 0, 16, 16);
+    ctx.drawImage(img, 0, 0);
+    const d = ctx.getImageData(0, 0, 16, 16).data;
+    const tint = BLOCK_TINT[name];
+    let r = 0, g = 0, b = 0, n = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      if (d[i + 3] < 26) continue; // skip transparent pixels
+      let pr = d[i], pg = d[i + 1], pb = d[i + 2];
+      if (tint) { pr *= tint[0] / 255; pg *= tint[1] / 255; pb *= tint[2] / 255; }
+      r += pr; g += pg; b += pb; n++;
+    }
+    if (!n) return null;
+    const rgb = [Math.round(r / n), Math.round(g / n), Math.round(b / n)];
+    cache[name] = rgb;
+    return rgb;
+  }
+
+  // Build a palette containing every placeable solid block in the game.
+  // Colors are averaged from the real 16x16 textures (cached in localStorage).
+  function buildFullPalette(onProgress) {
+    if (fullPalette) return Promise.resolve(fullPalette);
+    if (fullPalettePromise) return fullPalettePromise;
+
+    fullPalettePromise = (async () => {
+      const data = getBlockData();
+      if (!data) throw new Error('block tables not ready (wait for the world to finish loading)');
+
+      const { blockNames, texNames, ft, kind } = data;
+      let cache = {};
+      try { cache = JSON.parse(localStorage.getItem(TEXCOLOR_KEY)) || {}; } catch (e) { cache = {}; }
+
+      // Collect unique solid-block textures (side face), grass uses its (tinted) top.
+      const entries = [];
+      const seenTex = new Set();
+      for (let id = 1; id < blockNames.length; id++) {
+        if (kind[id] !== 1) continue; // SOLID only
+        const bname = blockNames[id] || '';
+        if (EXCLUDED_BLOCKS.has(bname.toLowerCase())) continue; // e.g. Bedrock
+        const isGrass = /grass block/i.test(bname);
+        const tex = texNames[ft[id * 6 + (isGrass ? 3 : 0)]];
+        if (!tex || seenTex.has(tex)) continue;
+        seenTex.add(tex);
+        entries.push({ id, name: bname, tex });
+      }
+
+      const rgb = [];
+      const ids = [];
+      let done = 0;
+      await Promise.all(entries.map(async (e) => {
+        let col = cache[e.tex];
+        if (!col) {
+          try { col = await averageTextureColor(e.tex, cache); } catch (err) { col = null; }
+        }
+        done++;
+        if (onProgress) onProgress(done, entries.length);
+        if (col) { e.col = col; }
+      }));
+
+      for (const e of entries) {
+        if (e.col) { rgb.push(e.col); ids.push(e.id); }
+      }
+
+      try { localStorage.setItem(TEXCOLOR_KEY, JSON.stringify(cache)); } catch (e) { /* ignore */ }
+      if (rgb.length < 4) throw new Error('could not resolve block colors');
+
+      fullPalette = { rgb, ids, all: true };
+      console.log(`[PixelArt] All-blocks palette ready: ${rgb.length} colors`);
+      return fullPalette;
+    })();
+
+    fullPalettePromise.catch(() => { fullPalettePromise = null; });
+    return fullPalettePromise;
+  }
+
   /* ─────────────────────────────────────────────
    * 4. IMAGE CONVERSION & DITHERING
    * ───────────────────────────────────────────── */
   function nearestWool(r, g, b, a) {
     if (a < 128) return -1; // Transparent → Air
+    const pal = activePalette.rgb;
     let bestDist = Infinity;
     let bestIdx = 0;
-    for (let i = 0; i < WOOL_RGB.length; i++) {
-      const [wr, wg, wb] = WOOL_RGB[i];
+    for (let i = 0; i < pal.length; i++) {
+      const [wr, wg, wb] = pal[i];
       const dr = r - wr;
       const dg = g - wg;
       const db = b - wb;
@@ -463,7 +635,7 @@
           const woolIdx = nearestWool(r, g, b, 255);
           row.push(woolIdx);
 
-          const [targetR, targetG, targetB] = WOOL_RGB[woolIdx];
+          const [targetR, targetG, targetB] = activePalette.rgb[woolIdx];
           const errR = r - targetR;
           const errG = g - targetG;
           const errB = b - targetB;
@@ -486,7 +658,7 @@
     return { grid, w, h };
   }
 
-  function drawPreview(canvas, grid, w, h) {
+  function drawPreview(canvas, grid, w, h, pal = activePalette) {
     const scale = Math.max(1, Math.min(8, Math.floor(256 / Math.max(w, h))));
     canvas.width = w * scale;
     canvas.height = h * scale;
@@ -499,7 +671,7 @@
         if (wi < 0) {
           ctx.fillStyle = (x + y) % 2 ? '#222' : '#333';
         } else {
-          const [r, g, b] = WOOL_RGB[wi];
+          const [r, g, b] = pal.rgb[wi];
           ctx.fillStyle = `rgb(${r},${g},${b})`;
         }
         ctx.fillRect(x * scale, y * scale, scale, scale);
@@ -517,6 +689,7 @@
       this.grid = null;
       this.w = 0;
       this.h = 0;
+      this.blockIds = [...woolBlockIds];
       this.origin = { x: 0, y: 64, z: 0 };
       this.direction = 'north';
       this.sweepMode = 'ltr'; // 'ltr' (printer) or 'zigzag'
@@ -591,7 +764,7 @@
       }
     }
 
-    async start(grid, w, h, origin, direction, delayMs, lineRetries, sweepMode, movePlayer) {
+    async start(grid, w, h, origin, direction, delayMs, lineRetries, sweepMode, movePlayer, blockIds) {
       this.grid = grid;
       this.w = w;
       this.h = h;
@@ -601,6 +774,7 @@
       this.lineRetries = lineRetries;
       this.sweepMode = sweepMode;
       this.movePlayer = movePlayer;
+      this.blockIds = blockIds && blockIds.length ? blockIds : woolBlockIds;
       this.running = true;
       this.paused = false;
       this._cancel = false;
@@ -738,7 +912,7 @@
           const woolIdx = this.grid[imgRow][col];
           if (woolIdx < 0) continue; // transparent = skip
 
-          const blockId = woolBlockIds[woolIdx];
+          const blockId = this.blockIds[woolIdx];
           if (blockId == null || blockId < 0) continue;
 
           const bPos = this._blockCoords(col, rowFromBottom);
@@ -770,7 +944,7 @@
           for (let col = 0; col < this.w; col++) {
             const woolIdx = this.grid[imgRow][col];
             if (woolIdx < 0) continue;
-            const blockId = woolBlockIds[woolIdx];
+            const blockId = this.blockIds[woolIdx];
             const bPos = this._blockCoords(col, rowFromBottom);
             if (getBlock(bPos.x, bPos.y, bPos.z) !== blockId) {
               missingCols.push(col);
@@ -789,7 +963,7 @@
             if (this._cancel) return;
 
             const woolIdx = this.grid[imgRow][col];
-            const blockId = woolBlockIds[woolIdx];
+            const blockId = this.blockIds[woolIdx];
             const bPos = this._blockCoords(col, rowFromBottom);
 
             if (this.movePlayer) {
@@ -905,6 +1079,14 @@
           align-items: center;
           gap: 8px;
           letter-spacing: 0.2px;
+        }
+        #pa-header .byline {
+          margin-top: 2px;
+          font-size: 10px;
+          font-weight: 500;
+          color: #c084fc;
+          opacity: 0.85;
+          letter-spacing: 0.3px;
         }
 
         #pa-conn-status {
@@ -1233,7 +1415,10 @@
       </style>
 
       <div id="pa-header">
-        <div class="title"><span>🖨️</span> Pixel Art Printer <span style="font-size:10px; color:#c084fc; background:rgba(147,51,234,0.3); padding:2px 6px; border-radius:10px;">v1.4.0</span></div>
+        <div class="title-wrap">
+          <div class="title"><span>🖨️</span> Pixel Art Printer <span style="font-size:10px; color:#c084fc; background:rgba(147,51,234,0.3); padding:2px 6px; border-radius:10px;">v1.5.1</span></div>
+          <div class="byline">by @vibecodingonsol</div>
+        </div>
         <button id="pa-toggle-btn">▾</button>
       </div>
 
@@ -1309,6 +1494,11 @@
             <label>Dithering</label>
             <input type="checkbox" id="pa-dither" checked title="Floyd-Steinberg error diffusion for smoother gradients">
             <span style="font-size:11px; color:rgba(255,255,255,0.45); margin-left:6px;">Floyd-Steinberg (smoother)</span>
+          </div>
+          <div class="pa-row">
+            <label>All Blocks</label>
+            <input type="checkbox" id="pa-allblocks" title="Use every solid block in the game as a palette color (loads block textures once and caches them)">
+            <span id="pa-allblocks-info" style="font-size:11px; color:rgba(255,255,255,0.45); margin-left:6px;">Use all ~70 blocks</span>
           </div>
         </div>
 
@@ -1394,24 +1584,57 @@
     const previewInfo = panel.querySelector('#pa-preview-info');
     const startBtn = panel.querySelector('#pa-start-btn');
     const ditherCheck = panel.querySelector('#pa-dither');
+    const allBlocksCheck = panel.querySelector('#pa-allblocks');
+    const allBlocksInfo = panel.querySelector('#pa-allblocks-info');
     const maxWInput = panel.querySelector('#pa-maxw');
     const maxHInput = panel.querySelector('#pa-maxh');
 
     let loadedImage = null;
     let currentGrid = null, currentW = 0, currentH = 0;
+    let convertToken = 0;
 
-    const updateConversion = () => {
+    // Resolve which palette is currently selected, loading the all-blocks
+    // palette on demand and returning null if the user cancelled/failed.
+    const resolvePalette = async () => {
+      if (!allBlocksCheck.checked) {
+        allBlocksInfo.textContent = 'Use all ~70 blocks';
+        return { rgb: WOOL_RGB, ids: woolBlockIds.slice(), all: false };
+      }
+      if (fullPalette) return fullPalette;
+      allBlocksInfo.textContent = 'Loading block palette… 0%';
+      try {
+        const pal = await buildFullPalette((done, total) => {
+          allBlocksInfo.textContent = `Loading block palette… ${Math.round((done / total) * 100)}%`;
+        });
+        allBlocksInfo.textContent = `Using ${pal.rgb.length} blocks ✨`;
+        return pal;
+      } catch (e) {
+        allBlocksCheck.checked = false;
+        allBlocksInfo.textContent = 'Use all ~70 blocks';
+        alert('Could not load the all-blocks palette:\n' + e.message + '\n\nFalling back to the 16 wool colors.');
+        return { rgb: WOOL_RGB, ids: woolBlockIds.slice(), all: false };
+      }
+    };
+
+    const updateConversion = async () => {
       if (!loadedImage) return;
+      const token = ++convertToken;
+
       const maxW = parseInt(maxWInput.value) || 32;
       const maxH = parseInt(maxHInput.value) || 32;
       const dither = ditherCheck.checked;
+
+      const pal = await resolvePalette();
+      if (token !== convertToken) return; // a newer conversion superseded this one
+      activePalette = pal;
+
       const { grid, w, h } = imageToGrid(loadedImage, maxW, maxH, dither);
       currentGrid = grid;
       currentW = w;
       currentH = h;
-      drawPreview(previewCanvas, grid, w, h);
+      drawPreview(previewCanvas, grid, w, h, pal);
       const blocks = grid.flat().filter((v) => v >= 0).length;
-      previewInfo.textContent = `${w}×${h} blocks (${blocks} wool blocks)`;
+      previewInfo.textContent = `${w}×${h} blocks (${blocks} blocks, ${pal.rgb.length} colors)`;
       previewWrap.classList.add('visible');
       dropzone.style.display = 'none';
       if (capturedWS && capturedWS.readyState === 1) {
@@ -1450,6 +1673,7 @@
     maxWInput.addEventListener('change', updateConversion);
     maxHInput.addEventListener('change', updateConversion);
     ditherCheck.addEventListener('change', updateConversion);
+    allBlocksCheck.addEventListener('change', updateConversion);
 
     // ── Get player coordinates ──
     panel.querySelector('#pa-get-pos').addEventListener('click', () => {
@@ -1511,7 +1735,8 @@
       }
       return grid;
     };
-    const gridThumbnail = (grid, w, h) => {
+    const gridThumbnail = (grid, w, h, pal) => {
+      const palette = (pal && pal.rgb) || WOOL_RGB;
       const scale = Math.max(1, Math.floor(96 / Math.max(w, h)));
       const c = document.createElement('canvas');
       c.width = w * scale;
@@ -1521,7 +1746,7 @@
         for (let x = 0; x < w; x++) {
           const v = grid[y][x];
           if (v < 0) ctx.fillStyle = (x + y) % 2 ? '#1a1a1a' : '#252525';
-          else { const [r, g, b] = WOOL_RGB[v]; ctx.fillStyle = `rgb(${r},${g},${b})`; }
+          else { const [r, g, b] = palette[v]; ctx.fillStyle = `rgb(${r},${g},${b})`; }
           ctx.fillRect(x * scale, y * scale, scale, scale);
         }
       }
@@ -1616,19 +1841,20 @@
       const retries = parseInt(panel.querySelector('#pa-retries').value) || 30;
       const mode = panel.querySelector('#pa-mode').value;
       const movePlayerOpt = panel.querySelector('#pa-move-player').checked;
+      const pal = activePalette;
 
       startBtn.style.display = 'none';
       pauseBtn.style.display = '';
       stopBtn.style.display = '';
 
-      await printer.start(currentGrid, currentW, currentH, origin, dir, delay, retries, mode, movePlayerOpt);
+      await printer.start(currentGrid, currentW, currentH, origin, dir, delay, retries, mode, movePlayerOpt, pal.ids);
 
       startBtn.style.display = '';
       pauseBtn.style.display = 'none';
       stopBtn.style.display = 'none';
 
       if (!printer._cancel) {
-        recordArtwork(redoId || null, currentGrid, currentW, currentH, origin, dir, delay, retries, mode, movePlayerOpt);
+        recordArtwork(redoId || null, currentGrid, currentW, currentH, origin, dir, delay, retries, mode, movePlayerOpt, pal);
       }
     };
 
@@ -1641,13 +1867,16 @@
       stopBtn.style.display = 'none';
     };
 
-    const recordArtwork = (id, grid, w, h, origin, direction, delay, retries, mode, movePlayerOpt) => {
-      const preview = gridThumbnail(grid, w, h);
+    const recordArtwork = (id, grid, w, h, origin, direction, delay, retries, mode, movePlayerOpt, pal) => {
+      const palette = (pal && pal.rgb) ? pal : activePalette;
+      const preview = gridThumbnail(grid, w, h, palette);
       const packed = encodeGrid(grid);
+      const paletteRec = { rgb: palette.rgb, ids: palette.ids, all: !!palette.all };
       const existing = id ? artworks.find((a) => a.id === id) : null;
       if (existing) {
         existing.preview = preview;
         existing.grid = packed;
+        existing.palette = paletteRec;
         existing.ts = Date.now();
         existing.w = w; existing.h = h;
         existing.origin = origin; existing.direction = direction;
@@ -1659,7 +1888,7 @@
           name: `Artwork ${artworks.length + 1}`,
           ts: Date.now(), w, h, origin, direction,
           delayMs: delay, retries, sweepMode: mode, movePlayer: movePlayerOpt,
-          preview, grid: packed,
+          preview, grid: packed, palette: paletteRec,
         });
       }
       if (artworks.length > 100) artworks = artworks.slice(0, 100);
@@ -1667,18 +1896,28 @@
       renderGallery();
     };
 
-    const redoArtwork = (art) => {
+    const redoArtwork = async (art) => {
       if (printer.running) { alert('Printer is busy. Stop the current job first.'); return; }
       if (!confirm(`Rebuild "${art.name}" (${art.w}×${art.h}) at (${art.origin.x}, ${art.origin.y}, ${art.origin.z}) facing ${dirLabel(art.direction)}?`)) return;
+
+      const pal = sanitizePalette((art.palette && art.palette.rgb && art.palette.ids)
+        ? art.palette
+        : { rgb: WOOL_RGB, ids: woolBlockIds.slice(), all: false });
+      activePalette = pal;
+      allBlocksCheck.checked = !!pal.all;
+      allBlocksInfo.textContent = pal.all ? `Using ${pal.rgb.length} blocks ✨` : 'Use all ~70 blocks';
+      if (pal.all && !fullPalette) {
+        try { fullPalette = await buildFullPalette(); } catch (e) { /* use stored palette anyway */ }
+      }
 
       currentGrid = decodeGrid(art.grid, art.w, art.h);
       currentW = art.w;
       currentH = art.h;
       loadedImage = null;
 
-      drawPreview(previewCanvas, currentGrid, currentW, currentH);
+      drawPreview(previewCanvas, currentGrid, currentW, currentH, pal);
       const blocks = currentGrid.flat().filter((v) => v >= 0).length;
-      previewInfo.textContent = `${currentW}×${currentH} blocks (${blocks} wool blocks)`;
+      previewInfo.textContent = `${currentW}×${currentH} blocks (${blocks} blocks, ${pal.rgb.length} colors)`;
       previewWrap.classList.add('visible');
       dropzone.style.display = 'none';
 
