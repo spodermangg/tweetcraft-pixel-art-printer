@@ -1843,6 +1843,20 @@
       const movePlayerOpt = panel.querySelector('#pa-move-player').checked;
       const pal = activePalette;
 
+      // Height check: walls grow upward from origin.y, floors stay at origin.y.
+      // The topmost block must stay below y = 128 (max valid y is 127).
+      const topY = dir === 'floor' ? origin.y : origin.y + currentH - 1;
+      if (topY >= 128) {
+        alert(
+          `⚠️ Cannot start printing: the artwork would exceed the world height limit.\n\n` +
+          `Origin Y: ${origin.y}\n` +
+          `Image height: ${currentH}\n` +
+          `Top block Y: ${topY} (max allowed: 127)\n\n` +
+          `Lower the origin Y or reduce the image height so it fits below Y=128.`
+        );
+        return;
+      }
+
       startBtn.style.display = 'none';
       pauseBtn.style.display = '';
       stopBtn.style.display = '';
