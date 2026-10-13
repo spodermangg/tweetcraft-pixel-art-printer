@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TweetCraft Pixel Art Printer
 // @namespace    https://tweetcraft.jai.vin
-// @version      1.5.1
+// @version      1.6.0
 // @description  Upload an image → auto-convert to wool colors → print pixel art like a bot (moves left→right, places blocks, fixes missed blocks per line)
 // @author       @vibecodingonsol
 // @match        https://tweetcraft.jai.vin/r/*
@@ -52,6 +52,25 @@
   function attachSocketListeners(ws) {
     if (!ws || ws._pixelArtMonitored) return;
     ws._pixelArtMonitored = true;
+    try {
+      const origSend = ws.send;
+      ws.send = function (data) {
+        if (data instanceof ArrayBuffer) {
+          try {
+            const dv = new DataView(data);
+            const t = dv.getUint8(0);
+            if (t === 2) {
+              console.log('[PIXEL-DEBUG] SEND EDIT(BIN):', Array.from(new Uint8Array(data)));
+            }
+          } catch (e) {}
+        } else if (typeof data === 'string') {
+          if (data.includes('"t":"place"')) {
+            console.log('[PIXEL-DEBUG] SEND PLACE(JSON):', data);
+          }
+        }
+        return origSend.apply(this, arguments);
+      };
+    } catch (e) {}
 
     ws.addEventListener('message', (event) => {
       if (typeof event.data === 'string') {
@@ -74,6 +93,21 @@
             playerInfo.verified = !!(msg.you?.h || msg.owner);
             updateStatusUI();
           }
+          if (msg.t === 'old' || (msg.t === 'sys' && /out of date|reload|latest version|update available/i.test(msg.m || ''))) {
+            // The game updated on the server but this tab is still running old
+            // cached JS, so the server rejects every block edit. Only a reload
+            // of the game fixes it — not re-verifying the X account.
+            console.warn('[PixelArt] Out-of-date client detected:', msg.m || '(old protocol)');
+            if (activePrinter && activePrinter.running) activePrinter.stop();
+            alert(
+              '⚠️ GAME UPDATED — RELOAD REQUIRED\n\n' +
+              'TweetCraft was updated and this tab is still running the old game version.\n' +
+              'The server rejects block edits until you reload.\n\n' +
+              `Server said: "${msg.m || 'old client'}"\n\n` +
+              '→ Force-reload this tab (Cmd/Ctrl + Shift + R) to load the new version, then print again.'
+            );
+            return;
+          }
           if (msg.t === 'sys') {
             console.warn('[PixelArt] Server system message:', msg.m);
             updateStatusUI();
@@ -89,6 +123,25 @@
             }
           }
         } catch (err) { }
+      } else if (event.data instanceof ArrayBuffer) {
+        // Check for DENY packet (type 4) or "old" style rejection
+        try {
+          const dv = new DataView(event.data);
+          const t = dv.getUint8(0);
+          if (t === 4 && event.data.byteLength >= 6) {
+            // DENY packet - server rejected the edit
+            console.warn('[PixelArt] DENY packet received from server');
+            if (activePrinter && activePrinter.running) {
+              activePrinter.stop();
+              alert(
+                '⚠️ SERVER REJECTED BLOCK PLACEMENT (DENY)\n\n' +
+                'The server rejected your block edit packet.\n\n' +
+                'This usually means the game version is out of date or the world is locked.\n' +
+                'Force-reload this tab (Cmd/Ctrl + Shift + R) and try again.'
+              );
+            }
+          }
+        } catch (e) { }
       }
     });
 
@@ -213,18 +266,32 @@
       return false;
     }
 
-    const buf = new ArrayBuffer(6);
-    const dv = new DataView(buf);
-    dv.setUint8(0, 2); // packet type 2: EDIT
-    dv.setUint32(1, ((ix << 17) | (iz << 7) | iy) >>> 0, true);
-    dv.setUint8(5, blockId);
+    // Don't send extra pos packets - might interfere; send only edit
+    // Try alternative format as fallback if needed
 
+    const mc = targetWindow.__mc || window.__mc;
+    // Use JSON place like the game does now
     try {
-      ws.send(buf);
+      if (mc && mc.net && typeof mc.net.place === 'function') {
+        if (mc.S && mc.S.hotbar && mc.S.slot >= 0 && mc.S.slot < 9) {
+          mc.S.hotbar[mc.S.slot] = blockId;
+          mc.S.counts = mc.S.counts || Array(9).fill(0);
+          mc.S.counts[mc.S.slot] = mc.S.counts[mc.S.slot] || 64;
+        }
+        if (mc.state && typeof mc.state.sendInv === 'function') {
+          try { mc.state.sendInv(); } catch (e) {}
+        }
+        mc.net.place(ix, iy, iz, 1, null);
+        packetsSentCount++;
+        return true;
+      }
+    } catch (e) { console.warn('[PixelArt] mc.net.place failed:', e); }
+    try {
+      ws.send(JSON.stringify({t: 'place', x: ix, y: iy, z: iz, f: 1}));
       packetsSentCount++;
       return true;
     } catch (e) {
-      console.error('[PixelArt] ws.send threw an error:', e);
+      console.warn('[PixelArt] JSON place failed:', e);
       return false;
     }
   }
@@ -695,7 +762,7 @@
       this.sweepMode = 'ltr'; // 'ltr' (printer) or 'zigzag'
       this.movePlayer = true;
       this.standoff = 2.5;
-      this.delayMs = 50;
+      this.delayMs = 250;
       this.lineRetries = 30;
       this.progress = { row: 0, col: 0, placed: 0, total: 0, status: '' };
       this.onProgress = null;
@@ -1416,7 +1483,7 @@
 
       <div id="pa-header">
         <div class="title-wrap">
-          <div class="title"><span>🖨️</span> Pixel Art Printer <span style="font-size:10px; color:#c084fc; background:rgba(147,51,234,0.3); padding:2px 6px; border-radius:10px;">v1.5.1</span></div>
+          <div class="title"><span>🖨️</span> Pixel Art Printer <span style="font-size:10px; color:#c084fc; background:rgba(147,51,234,0.3); padding:2px 6px; border-radius:10px;">v1.5.4</span></div>
           <div class="byline">by @vibecodingonsol</div>
         </div>
         <button id="pa-toggle-btn">▾</button>
