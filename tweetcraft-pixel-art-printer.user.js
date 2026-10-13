@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TweetCraft Pixel Art Printer
 // @namespace    https://tweetcraft.jai.vin
-// @version      1.6.0
+// @version      1.6.6
 // @description  Upload an image → auto-convert to wool colors → print pixel art like a bot (moves left→right, places blocks, fixes missed blocks per line)
 // @author       @vibecodingonsol
 // @match        https://tweetcraft.jai.vin/r/*
@@ -24,6 +24,9 @@
   let roomInfo = { name: '', lock: 0, mode: 'creative' };
   let playerInfo = { id: 0, name: '', handle: '', verified: false };
   let packetsSentCount = 0;
+  let lastHeldBlock = null;
+  let lastSinv = null;
+  let lastSelSlot = null;
 
   const OrigWS = targetWindow.WebSocket || window.WebSocket;
 
@@ -55,22 +58,18 @@
     try {
       const origSend = ws.send;
       ws.send = function (data) {
+        const fromUs = !!targetWindow.__pixelArtSending;
         if (data instanceof ArrayBuffer) {
           try {
-            const dv = new DataView(data);
-            const t = dv.getUint8(0);
-            if (t === 2) {
-              console.log('[PIXEL-DEBUG] SEND EDIT(BIN):', Array.from(new Uint8Array(data)));
-            }
-          } catch (e) {}
+            console.log('[PIXEL-DEBUG]' + (fromUs ? ' US' : ' GAME') + ' SEND BIN:', Array.from(new Uint8Array(data)));
+          } catch (e) { }
         } else if (typeof data === 'string') {
-          if (data.includes('"t":"place"')) {
-            console.log('[PIXEL-DEBUG] SEND PLACE(JSON):', data);
-          }
+          if (data.length < 300) console.log('[PIXEL-DEBUG]' + (fromUs ? ' US' : ' GAME') + ' SEND:', data);
+          else console.log('[PIXEL-DEBUG]' + (fromUs ? ' US' : ' GAME') + ' SEND:', data.slice(0, 300) + '…');
         }
         return origSend.apply(this, arguments);
       };
-    } catch (e) {}
+    } catch (e) { }
 
     ws.addEventListener('message', (event) => {
       if (typeof event.data === 'string') {
@@ -91,7 +90,17 @@
             playerInfo.name = msg.you?.name || '';
             playerInfo.handle = msg.you?.h || '';
             playerInfo.verified = !!(msg.you?.h || msg.owner);
+            console.log('[PIXEL-DEBUG] ROOM MODE =', roomInfo.mode, '| survival flag set =', !!(targetWindow.__mc || window.__mc)?.S?.sv);
             updateStatusUI();
+          }
+          // Log relevant incoming messages for debugging
+          if (msg.t && ['welcome', 'place', 'placeack', 'digack', 'sys', 'hitdeny', 'sinv', 'synced', 'hp', 'dead'].includes(msg.t)) {
+            const str = typeof event.data === 'string' ? event.data : '';
+            console.log('[PIXEL-DEBUG] RECV:', str.length < 250 ? str : str.slice(0, 250) + '…');
+          }
+          if (msg.t === 'sinv') {
+            lastSinv = { s: Array.isArray(msg.s) ? msg.s : null, sel: msg.sel };
+            console.log('[PIXEL-DEBUG] SINV slots =', msg.s ? msg.s.map(v => v && v[0]).join(',') : '(none)', '| sel =', msg.sel);
           }
           if (msg.t === 'old' || (msg.t === 'sys' && /out of date|reload|latest version|update available/i.test(msg.m || ''))) {
             // The game updated on the server but this tab is still running old
@@ -266,33 +275,69 @@
       return false;
     }
 
-    // Don't send extra pos packets - might interfere; send only edit
-    // Try alternative format as fallback if needed
+    // The game (survival-style build rooms) places a block via:
+    //   1) {"t":"inv","hotbar":[9 block ids],"slot":n}  -> tells the server what we hold
+    //   2) {"t":"place","x","y","z","f"}                -> places held block against face f of block (x,y,z)
+    // window.__mc only exists in DEV, so we replicate the exact wire messages ourselves.
+    const FACES = [[0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]];
 
-    const mc = targetWindow.__mc || window.__mc;
-    // Use JSON place like the game does now
+    targetWindow.__pixelArtSending = true;
     try {
-      if (mc && mc.net && typeof mc.net.place === 'function') {
-        if (mc.S && mc.S.hotbar && mc.S.slot >= 0 && mc.S.slot < 9) {
-          mc.S.hotbar[mc.S.slot] = blockId;
-          mc.S.counts = mc.S.counts || Array(9).fill(0);
-          mc.S.counts[mc.S.slot] = mc.S.counts[mc.S.slot] || 64;
-        }
-        if (mc.state && typeof mc.state.sendInv === 'function') {
-          try { mc.state.sendInv(); } catch (e) {}
-        }
-        mc.net.place(ix, iy, iz, 1, null);
+      if (blockId === 0) {
+        // Clearing a block: the server removes blocks via the dig flow. Best-effort:
+        // send a start+done dig on the target (creative rooms accept this as air).
+        ws.send(JSON.stringify({ t: 'inv', hotbar: [0, 0, 0, 0, 0, 0, 0, 0, 0], slot: 0 }));
+        ws.send(buildPosPacket(ix + 0.5, iy + 0.5, iz + 0.5));
+        ws.send(JSON.stringify({ t: 'dig', s: 0, x: ix, y: iy, z: iz, f: 1, i: 1 }));
+        ws.send(JSON.stringify({ t: 'dig', s: 2, x: ix, y: iy, z: iz, f: 1, i: 1 }));
         packetsSentCount++;
         return true;
       }
-    } catch (e) { console.warn('[PixelArt] mc.net.place failed:', e); }
-    try {
-      ws.send(JSON.stringify({t: 'place', x: ix, y: iy, z: iz, f: 1}));
+
+      // Pick a solid neighbour so we have a valid face to place against.
+      let nx = ix, ny = iy, nz = iz, face = 1, found = false;
+      for (let fi = 0; fi < 6; fi++) {
+        const d = FACES[fi];
+        const cx = ix - d[0], cy = iy - d[1], cz = iz - d[2];
+        if (cy < 0 || cy >= 128) continue;
+        const b = getBlock(cx, cy, cz);
+        if (b > 0 && b !== 255) { nx = cx; ny = cy; nz = cz; face = fi; found = true; break; }
+      }
+      if (!found) {
+        // No solid neighbour: try to place directly (server may still accept it).
+        nx = ix; ny = iy; nz = iz; face = 1;
+      }
+
+      // Choose which inventory slot holds this block. The server is authoritative
+      // about the hotbar (survival rooms ignore client-setSlot), so prefer a slot
+      // that already contains the block; otherwise fabricate a hotbar via `inv`.
+      let slot = -1;
+      if (lastSinv && Array.isArray(lastSinv.s)) {
+        for (let i = 0; i < 9; i++) {
+          const entry = lastSinv.s[i];
+          if (entry && entry[0] === blockId) { slot = i; break; }
+        }
+      }
+      if (slot === -1) {
+        slot = 0;
+        ws.send(JSON.stringify({ t: 'inv', hotbar: [blockId, blockId, blockId, blockId, blockId, blockId, blockId, blockId, blockId], slot: 0 }));
+        lastSelSlot = null;
+        lastSinv = null;
+      }
+      if (lastSelSlot !== slot) {
+        ws.send(JSON.stringify({ t: 'sel', i: slot }));
+        lastSelSlot = slot;
+      }
+      ws.send(buildPosPacket(nx + 0.5, ny + 0.5, nz + 0.5));
+      ws.send(JSON.stringify({ t: 'place', x: nx, y: ny, z: nz, f: face }));
+      console.log('[PIXEL-DEBUG] US place block', blockId, 'slot', slot, 'target', ix, iy, iz, 'against', nx, ny, nz, 'face', face, found ? '(solid nbr)' : '(no nbr)');
       packetsSentCount++;
       return true;
     } catch (e) {
-      console.warn('[PixelArt] JSON place failed:', e);
+      console.warn('[PixelArt] place failed:', e);
       return false;
+    } finally {
+      targetWindow.__pixelArtSending = false;
     }
   }
 
@@ -381,6 +426,31 @@
       const st = getPlayerState();
       if (st) { st[3] = 0; st[4] = 0; st[5] = 0; }
     }
+  }
+
+  // Builds the 18-byte binary POS frame (type 1) exactly like net.js:pos(),
+  // so the server learns where we are before we place. The printer moves the
+  // player through the WASM engine, but the game only streams POS periodically
+  // — without an up-to-date position the server drops placements that are out
+  // of reach (which is why only the first few columns stuck).
+  function buildPosPacket(lookX, lookY, lookZ) {
+    const st = getPlayerState();
+    const px = st ? st[0] : 0, py = st ? st[1] : 0, pz = st ? st[2] : 0;
+    const dx = lookX - px, dy = lookY - (py + 1.62), dz = lookZ - pz;
+    const horiz = Math.hypot(dx, dz) || 1e-6;
+    const yaw = Math.atan2(-dx, -dz);
+    const pitch = Math.atan2(dy, horiz);
+    const flags = st ? ((st[9] ? 1 : 0) | (st[7] ? 2 : 0)) : 0;
+    const buf = new ArrayBuffer(18);
+    const dv = new DataView(buf);
+    dv.setUint8(0, 1);
+    dv.setFloat32(1, px, true);
+    dv.setFloat32(5, py, true);
+    dv.setFloat32(9, pz, true);
+    dv.setInt16(13, Math.round(yaw * 1e4), true);
+    dv.setInt16(15, Math.round(pitch * 1e4), true);
+    dv.setUint8(17, flags);
+    return buf;
   }
 
   /* ─────────────────────────────────────────────
@@ -762,7 +832,7 @@
       this.sweepMode = 'ltr'; // 'ltr' (printer) or 'zigzag'
       this.movePlayer = true;
       this.standoff = 2.5;
-      this.delayMs = 250;
+      this.delayMs = 180;
       this.lineRetries = 30;
       this.progress = { row: 0, col: 0, placed: 0, total: 0, status: '' };
       this.onProgress = null;
@@ -807,7 +877,7 @@
         case 'west':  // wall extends -Z, facing east (+X)
           return { x: this.origin.x, y, z: this.origin.z - col };
         case 'floor': // flat on ground, +X / +Z
-          return { x: this.origin.x + col, y: this.origin.y, z: this.origin.z + rowFromBottom };
+          return { x: this.origin.x + col, y: this.origin.y, z: this.origin.z + (this.h - 1 - rowFromBottom) };
         default:
           return { x: this.origin.x + col, y, z: this.origin.z };
       }
@@ -1483,7 +1553,7 @@
 
       <div id="pa-header">
         <div class="title-wrap">
-          <div class="title"><span>🖨️</span> Pixel Art Printer <span style="font-size:10px; color:#c084fc; background:rgba(147,51,234,0.3); padding:2px 6px; border-radius:10px;">v1.5.4</span></div>
+          <div class="title"><span>🖨️</span> Pixel Art Printer <span style="font-size:10px; color:#c084fc; background:rgba(147,51,234,0.3); padding:2px 6px; border-radius:10px;">v1.6.6</span></div>
           <div class="byline">by @vibecodingonsol</div>
         </div>
         <button id="pa-toggle-btn">▾</button>
@@ -1529,7 +1599,7 @@
           </div>
           <div class="pa-row">
             <label>Delay (ms)</label>
-            <input type="number" id="pa-delay" value="50" min="10" max="2000" step="5">
+            <input type="number" id="pa-delay" value="180" min="10" max="2000" step="5">
           </div>
           <div class="pa-row">
             <label>Line Retries</label>
@@ -1902,9 +1972,16 @@
 
       discoverWoolIds();
 
+      const dbgMc = targetWindow.__mc || window.__mc;
+      console.log('[PIXEL-DEBUG] PRINT START — roomMode=', roomInfo.mode,
+        '| S.sv=', !!(dbgMc && dbgMc.S && dbgMc.S.sv),
+        '| survivalClient=', !!(dbgMc && dbgMc.survival),
+        '| net.place=', !!(dbgMc && dbgMc.net && dbgMc.net.place),
+        '| S.hotbar=', dbgMc && dbgMc.S ? JSON.stringify(dbgMc.S.hotbar) : 'n/a');
+
       const origin = getOrigin();
       const dir = panel.querySelector('#pa-dir').value;
-      const delay = parseInt(panel.querySelector('#pa-delay').value) || 50;
+      const delay = parseInt(panel.querySelector('#pa-delay').value) || 180;
       const retries = parseInt(panel.querySelector('#pa-retries').value) || 30;
       const mode = panel.querySelector('#pa-mode').value;
       const movePlayerOpt = panel.querySelector('#pa-move-player').checked;
@@ -2019,7 +2096,7 @@
       if (printer.running) { alert('Printer is busy. Stop the current job first.'); return; }
       if (!confirm(`Quick-clean "${art.name}" (${art.w}×${art.h}) at (${art.origin.x}, ${art.origin.y}, ${art.origin.z})?`)) return;
 
-      const delay = parseInt(panel.querySelector('#pa-delay').value) || 50;
+      const delay = parseInt(panel.querySelector('#pa-delay').value) || 180;
       const retries = parseInt(panel.querySelector('#pa-retries').value) || 30;
       const followPlayer = panel.querySelector('#pa-move-player').checked;
       switchTab('printer');
@@ -2059,7 +2136,7 @@
 
       const origin = getOrigin();
       const dir = panel.querySelector('#pa-dir').value;
-      const delay = parseInt(panel.querySelector('#pa-delay').value) || 50;
+      const delay = parseInt(panel.querySelector('#pa-delay').value) || 180;
       const retries = parseInt(panel.querySelector('#pa-retries').value) || 30;
       const followPlayer = panel.querySelector('#pa-move-player').checked;
 
