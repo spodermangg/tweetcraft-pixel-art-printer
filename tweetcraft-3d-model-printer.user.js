@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TweetCraft 3D Model Printer
 // @namespace    https://tweetcraft.jai.vin
-// @version      1.2.0
+// @version      1.2.6
 // @description  Upload a 3D model (OBJ/MTL, STL, GLB or FBX) → voxelize it → print it into your TweetCraft world as real blocks. Respects the 128-block max build height.
 // @author       @vibecodingonsol
 // @match        https://tweetcraft.jai.vin/r/*
@@ -23,6 +23,9 @@
   let roomInfo = { name: '', lock: 0, mode: 'creative' };
   let playerInfo = { id: 0, name: '', handle: '', verified: false };
   let packetsSentCount = 0;
+  let lastHeldBlock = null;
+  let lastSinv = null;
+  let lastSelSlot = null;
 
   /* ─────────────────────────────────────────────
    * SERVER-ACKNOWLEDGED BLOCK STATE
@@ -94,6 +97,24 @@
   function attachSocketListeners(ws) {
     if (!ws || ws._model3dMonitored) return;
     ws._model3dMonitored = true;
+    try {
+      const origSend = ws.send;
+      ws.send = function (data) {
+        const fromUs = !!targetWindow.__model3dSending;
+        if (data instanceof ArrayBuffer) {
+          try {
+            const dv = new DataView(data);
+            const t = dv.getUint8(0);
+            if (t === 2) console.log('[3D-DEBUG]' + (fromUs ? ' US' : ' GAME') + ' SEND EDIT(BIN):', Array.from(new Uint8Array(data)));
+          } catch (e) { }
+        } else if (typeof data === 'string') {
+          if (data.includes('"t":"place"') || data.includes('"t":"inv"') || data.includes('"t":"sel"')) {
+            console.log('[3D-DEBUG]' + (fromUs ? ' US' : ' GAME') + ' SEND:', data);
+          }
+        }
+        return origSend.apply(this, arguments);
+      };
+    } catch (e) { }
     try { ws.binaryType = 'arraybuffer'; } catch (e) { /* ignore */ }
 
     ws.addEventListener('message', (event) => {
@@ -115,6 +136,21 @@
             playerInfo.verified = !!((msg.you && msg.you.h) || msg.owner);
             updateStatusUI();
           }
+          if (msg.t === 'sinv') {
+            lastSinv = { s: Array.isArray(msg.s) ? msg.s : null, sel: msg.sel };
+          }
+          if (msg.t === 'old' || (msg.t === 'sys' && /out of date|reload|latest version|update available/i.test(msg.m || ''))) {
+            console.warn('[Model3D] Out-of-date client detected:', msg.m || '(old protocol)');
+            if (activePrinter && activePrinter.running) activePrinter.stop();
+            alert(
+              '⚠️ GAME UPDATED — RELOAD REQUIRED\n\n' +
+              'TweetCraft was updated and this tab is still running the old game version.\n' +
+              'The server rejects block edits until you reload.\n\n' +
+              `Server said: "${msg.m || 'old client'}"\n\n` +
+              '→ Force-reload this tab (Cmd/Ctrl + Shift + R) to load the new version, then print again.'
+            );
+            return;
+          }
           if (msg.t === 'sys') {
             console.warn('[Model3D] Server system message:', msg.m);
             updateStatusUI();
@@ -130,6 +166,24 @@
             }
           }
         } catch (err) { /* non-JSON frame */ }
+      } else if (event.data instanceof ArrayBuffer) {
+        try {
+          const dv = new DataView(event.data);
+          const t = dv.getUint8(0);
+          if (t === 4 && event.data.byteLength >= 6) {
+            console.warn('[Model3D] DENY packet received from server');
+            if (activePrinter && activePrinter.running) {
+              activePrinter.stop();
+              alert(
+                '⚠️ SERVER REJECTED BLOCK PLACEMENT (DENY)\n\n' +
+                'The server rejected your block edit packet.\n\n' +
+                'This usually means the game version is out of date.\n' +
+                'Force-reload this tab (Cmd/Ctrl + Shift + R) and try again.'
+              );
+            }
+          }
+        } catch (e) { }
+        ingestServerEdits(event.data);
       } else {
         ingestServerEdits(event.data);
       }
@@ -237,20 +291,66 @@
       return false;
     }
 
-    const buf = new ArrayBuffer(6);
-    const dv = new DataView(buf);
-    dv.setUint8(0, 2); // packet type 2: EDIT
-    dv.setUint32(1, ((ix << 17) | (iz << 7) | iy) >>> 0, true);
-    dv.setUint8(5, blockId);
+    // Survival-style build rooms place a block via:
+    //   1) {"t":"inv","hotbar":[9 block ids],"slot":n}    -> server learns what we hold
+    //   2) {"t":"sel","i":n}                              -> select the holding slot
+    //   3) {"t":"place","x","y","z","f"}                  -> place held block against face f
+    // window.__mc only exists in DEV, so replicate the exact wire messages here.
+    const FACES = [[0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]];
 
+    targetWindow.__model3dSending = true;
     try {
-      ws.send(buf);
+      if (blockId === 0) {
+        // Clearing: the server removes blocks through the dig flow (best effort).
+        ws.send(JSON.stringify({ t: 'inv', hotbar: [0, 0, 0, 0, 0, 0, 0, 0, 0], slot: 0 }));
+        ws.send(buildPosPacket(ix + 0.5, iy + 0.5, iz + 0.5));
+        ws.send(JSON.stringify({ t: 'dig', s: 0, x: ix, y: iy, z: iz, f: 1, i: 1 }));
+        ws.send(JSON.stringify({ t: 'dig', s: 2, x: ix, y: iy, z: iz, f: 1, i: 1 }));
+        packetsSentCount++;
+        sentEdits.set(editKey(ix, iy, iz), 0);
+        return true;
+      }
+
+      // Pick a solid neighbour so we have a valid face to place against.
+      let nx = ix, ny = iy, nz = iz, face = 1, found = false;
+      for (let fi = 0; fi < 6; fi++) {
+        const d = FACES[fi];
+        const cx = ix - d[0], cy = iy - d[1], cz = iz - d[2];
+        if (cy < 0 || cy >= WORLD_MAX_Y) continue;
+        const b = getBlock(cx, cy, cz);
+        if (b > 0 && b !== 255) { nx = cx; ny = cy; nz = cz; face = fi; found = true; break; }
+      }
+      if (!found) { nx = ix; ny = iy; nz = iz; face = 1; }
+
+      // Choose a slot that already holds this block; otherwise fabricate a hotbar.
+      let slot = -1;
+      if (lastSinv && Array.isArray(lastSinv.s)) {
+        for (let i = 0; i < 9; i++) {
+          const entry = lastSinv.s[i];
+          if (entry && entry[0] === blockId) { slot = i; break; }
+        }
+      }
+      if (slot === -1) {
+        slot = 0;
+        ws.send(JSON.stringify({ t: 'inv', hotbar: [blockId, blockId, blockId, blockId, blockId, blockId, blockId, blockId, blockId], slot: 0 }));
+        lastSelSlot = null;
+        lastSinv = null;
+      }
+      if (lastSelSlot !== slot) {
+        ws.send(JSON.stringify({ t: 'sel', i: slot }));
+        lastSelSlot = slot;
+      }
+      ws.send(buildPosPacket(nx + 0.5, ny + 0.5, nz + 0.5));
+      ws.send(JSON.stringify({ t: 'place', x: nx, y: ny, z: nz, f: face }));
+      console.log('[MODEL3D-DEBUG] US place block', blockId, 'slot', slot, 'target', ix, iy, iz, 'against', nx, ny, nz, 'face', face, found ? '(solid nbr)' : '(no nbr)');
       packetsSentCount++;
       sentEdits.set(editKey(ix, iy, iz), blockId);
       return true;
     } catch (e) {
-      console.error('[Model3D] ws.send threw an error:', e);
+      console.warn('[Model3D] place failed:', e);
       return false;
+    } finally {
+      targetWindow.__model3dSending = false;
     }
   }
 
@@ -327,6 +427,29 @@
       const st = getPlayerState();
       if (st) { st[3] = 0; st[4] = 0; st[5] = 0; }
     }
+  }
+
+  // 18-byte binary POS frame (type 1), mirrored from net.js:pos(). The server
+  // receives our position this way; the game only streams POS periodically and
+  // drops placements that are out of reach otherwise.
+  function buildPosPacket(lookX, lookY, lookZ) {
+    const st = getPlayerState();
+    const px = st ? st[0] : 0, py = st ? st[1] : 0, pz = st ? st[2] : 0;
+    const dx = lookX - px, dy = lookY - (py + 1.62), dz = lookZ - pz;
+    const horiz = Math.hypot(dx, dz) || 1e-6;
+    const yaw = Math.atan2(-dx, -dz);
+    const pitch = Math.atan2(dy, horiz);
+    const flags = st ? ((st[9] ? 1 : 0) | (st[7] ? 2 : 0)) : 0;
+    const buf = new ArrayBuffer(18);
+    const dv = new DataView(buf);
+    dv.setUint8(0, 1);
+    dv.setFloat32(1, px, true);
+    dv.setFloat32(5, py, true);
+    dv.setFloat32(9, pz, true);
+    dv.setInt16(13, Math.round(yaw * 1e4), true);
+    dv.setInt16(15, Math.round(pitch * 1e4), true);
+    dv.setUint8(17, flags);
+    return buf;
   }
 
   /* ─────────────────────────────────────────────
@@ -933,7 +1056,7 @@
     constructor() {
       this.running = false;
       this.paused = false;
-      this.delayMs = 50;
+      this.delayMs = 180;
       this.retries = 12;
       this.movePlayer = true;
       this.standoff = 3;
@@ -1079,6 +1202,7 @@
    * ───────────────────────────────────────────── */
   let currentVoxels = null; // { voxels, dx, dy, dz, count, surfaceCount }
   let currentName = '';
+  let stagedItems = null; // exact block list staged by a gallery redo
 
   function updateStatusUI() {
     const dot = document.getElementById('m3d-conn-dot');
@@ -1262,11 +1386,30 @@
         #m3d-progress-bar-outer { width: 100%; height: 8px; background: rgba(255,255,255,0.08); border-radius: 4px; overflow: hidden; margin-bottom: 8px; }
         #m3d-progress-bar { height: 100%; width: 0%; background: linear-gradient(90deg, #14b8a6, #3b82f6); border-radius: 4px; transition: width 0.2s ease; }
         #m3d-status { font-size: 11px; color: rgba(255,255,255,0.65); line-height: 1.4; }
+        .m3d-tabs { display: flex; gap: 2px; background: rgba(0,0,0,0.2); border-bottom: 1px solid rgba(255,255,255,0.06); border-radius: 8px; overflow: hidden; }
+        .m3d-tab { flex: 1; background: none; border: none; border-bottom: 2px solid transparent; color: rgba(255,255,255,0.55); padding: 8px 6px; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.15s; }
+        .m3d-tab:hover { color: #fff; }
+        .m3d-tab.active { color: #fff; border-bottom-color: #14b8a6; }
+        #m3d-gallery-count { display: inline-block; min-width: 16px; padding: 0 5px; margin-left: 2px; font-size: 10px; border-radius: 9px; background: rgba(20,184,166,0.3); color: #99f6e4; }
+        .m3d-tabpane { display: flex; flex-direction: column; gap: 12px; }
+        #m3d-gallery-empty { font-size: 11px; color: rgba(255,255,255,0.45); line-height: 1.5; padding: 6px 2px; }
+        #m3d-gallery-list { display: flex; flex-direction: column; gap: 8px; }
+        .m3d-art { display: flex; gap: 10px; align-items: center; background: rgba(0,0,0,0.25); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 8px; }
+        .m3d-art-thumb { width: 54px; height: 54px; object-fit: contain; border-radius: 6px; background: rgba(255,255,255,0.05); flex-shrink: 0; }
+        .m3d-art-info { flex: 1; min-width: 0; }
+        .m3d-art-name { font-size: 12px; font-weight: 700; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: text; }
+        .m3d-art-meta { font-size: 10px; color: rgba(255,255,255,0.5); font-family: monospace; margin-top: 2px; }
+        .m3d-art-btns { display: flex; gap: 4px; flex-shrink: 0; }
+        .m3d-art-btn { width: 28px; height: 28px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.06); color: #ddd; cursor: pointer; font-size: 13px; line-height: 1; transition: all 0.15s; }
+        .m3d-art-btn.redo:hover { background: rgba(59,130,246,0.3); color: #bfdbfe; }
+        .m3d-art-btn.clean:hover { background: rgba(234,179,8,0.3); color: #fde68a; }
+        .m3d-art-btn.del:hover { background: rgba(239,68,68,0.3); color: #fca5a5; }
+        #m3d-gallery-clearall { margin-top: 2px; }
       </style>
 
       <div id="m3d-header">
         <div>
-          <div class="title"><span>🧊</span> 3D Model Printer <span style="font-size:10px; color:#5eead4; background:rgba(20,184,166,0.25); padding:2px 6px; border-radius:10px;">v1.2.0</span></div>
+          <div class="title"><span>🧊</span> 3D Model Printer <span style="font-size:10px; color:#5eead4; background:rgba(20,184,166,0.25); padding:2px 6px; border-radius:10px;">v1.2.6</span></div>
           <div class="byline">by @vibecodingonsol</div>
         </div>
         <button id="m3d-toggle-btn">▾</button>
@@ -1279,6 +1422,11 @@
       </div>
 
       <div id="m3d-body">
+        <div class="m3d-tabs">
+          <button class="m3d-tab active" data-tab="printer">🖨️ Printer</button>
+          <button class="m3d-tab" data-tab="gallery">🖼️ Gallery <span id="m3d-gallery-count">0</span></button>
+        </div>
+        <div id="m3d-tab-printer" class="m3d-tabpane">
         <div class="m3d-section">
           <h3><span>📦 Model</span> <span style="font-weight:normal; font-size:10px; color:#5eead4;">OBJ (MTL) · STL · GLB · FBX</span></h3>
           <div id="m3d-dropzone">
@@ -1325,7 +1473,7 @@
           </div>
           <div class="m3d-row">
             <label>Delay (ms)</label>
-            <input type="number" id="m3d-delay" value="50" min="10" max="2000" step="5">
+            <input type="number" id="m3d-delay" value="180" min="10" max="2000" step="5">
           </div>
           <div class="m3d-row">
             <label>Layer Retries</label>
@@ -1361,6 +1509,16 @@
           <div id="m3d-progress-bar-outer"><div id="m3d-progress-bar"></div></div>
           <div id="m3d-status"></div>
         </div>
+        </div><!-- /#m3d-tab-printer -->
+
+        <div id="m3d-tab-gallery" class="m3d-tabpane" style="display:none;">
+          <div class="m3d-section">
+            <h3>🖼️ Saved Models</h3>
+            <div id="m3d-gallery-empty">No saved models yet. Build a model and it will appear here with its settings, so you can rebuild or quick-clean it later.</div>
+            <div id="m3d-gallery-list"></div>
+          </div>
+          <button id="m3d-gallery-clearall" class="m3d-btn-secondary">🗑️ Forget all saved models</button>
+        </div><!-- /#m3d-tab-gallery -->
       </div>
     `;
     document.body.appendChild(panel);
@@ -1527,6 +1685,7 @@
         colorModeSel.value = 'model';
       }
       updateColorRowState();
+      stagedItems = null;
       recomputeVoxels();
     };
 
@@ -1573,15 +1732,156 @@
       statusEl.innerHTML = `<strong>${pct}%</strong> — ${p.status || ''}`;
     };
 
+    // ── Saved-models gallery (persisted in this browser) ──
+    const M3D_ART_KEY = 'tcmodel3d.models.v1';
+    const loadModels = () => {
+      try { const r = JSON.parse(localStorage.getItem(M3D_ART_KEY)); return Array.isArray(r) ? r : []; }
+      catch (e) { return []; }
+    };
+    const persistModels = (list) => {
+      try { localStorage.setItem(M3D_ART_KEY, JSON.stringify(list)); }
+      catch (e) { console.warn('[Model3D] Could not save models:', e); }
+    };
+    const packKey = (x, y, z) => x * 16777216 + y * 4096 + z;
+    const encodeBlocks = (items) => {
+      const out = [];
+      for (const it of items) out.push(packKey(it.x, it.y, it.z), it.blockId);
+      return out;
+    };
+    const decodeBlocks = (flat) => {
+      const items = [];
+      for (let i = 0; i < flat.length; i += 2) {
+        const k = flat[i], id = flat[i + 1];
+        const z = k % 4096, y = Math.floor(k / 4096) % 4096, x = Math.floor(k / 16777216);
+        items.push({ x, y, z, blockId: id });
+      }
+      return items;
+    };
+    const modelThumbnail = () => {
+      try {
+        const c = document.createElement('canvas');
+        c.width = 96; c.height = 72;
+        c.getContext('2d').drawImage(previewCanvas, 0, 0, c.width, c.height);
+        return c.toDataURL('image/png');
+      } catch (e) { return ''; }
+    };
+
+    let models = loadModels();
+    let redoId = null;
+    const galleryList = panel.querySelector('#m3d-gallery-list');
+    const galleryEmpty = panel.querySelector('#m3d-gallery-empty');
+    const galleryCount = panel.querySelector('#m3d-gallery-count');
+
+    const switchTab = (name) => {
+      panel.querySelectorAll('.m3d-tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === name));
+      panel.querySelector('#m3d-tab-printer').style.display = name === 'printer' ? '' : 'none';
+      panel.querySelector('#m3d-tab-gallery').style.display = name === 'gallery' ? '' : 'none';
+    };
+
+    const renderGallery = () => {
+      galleryCount.textContent = String(models.length);
+      galleryList.innerHTML = '';
+      galleryEmpty.style.display = models.length ? 'none' : 'block';
+      for (const m of models) {
+        const el = document.createElement('div');
+        el.className = 'm3d-art';
+        const img = document.createElement('img');
+        img.className = 'm3d-art-thumb'; img.src = m.preview || ''; img.alt = m.name || 'model';
+        const info = document.createElement('div'); info.className = 'm3d-art-info';
+        const name = document.createElement('div'); name.className = 'm3d-art-name'; name.textContent = m.name || 'Untitled'; name.title = 'Click to rename';
+        const meta = document.createElement('div'); meta.className = 'm3d-art-meta';
+        meta.textContent = `${m.dx}×${m.dy}×${m.dz} · (${m.origin.x}, ${m.origin.y}, ${m.origin.z})`;
+        info.appendChild(name); info.appendChild(meta);
+        const btns = document.createElement('div'); btns.className = 'm3d-art-btns';
+        const bRedo = document.createElement('button'); bRedo.className = 'm3d-art-btn redo'; bRedo.textContent = '🔁'; bRedo.title = 'Rebuild this model';
+        const bClean = document.createElement('button'); bClean.className = 'm3d-art-btn clean'; bClean.textContent = '🧹'; bClean.title = 'Quick-clean this model';
+        const bDel = document.createElement('button'); bDel.className = 'm3d-art-btn del'; bDel.textContent = '🗑️'; bDel.title = 'Remove from list';
+        btns.appendChild(bRedo); btns.appendChild(bClean); btns.appendChild(bDel);
+        name.addEventListener('click', () => { const nn = prompt('Model name:', m.name || 'Untitled'); if (nn != null) { m.name = nn.trim() || m.name; persistModels(models); renderGallery(); } });
+        bRedo.addEventListener('click', () => redoModel(m));
+        bClean.addEventListener('click', () => cleanModel(m));
+        bDel.addEventListener('click', () => { if (!confirm(`Remove "${m.name}" from the list? (world blocks are not affected)`)) return; models = models.filter((a) => a.id !== m.id); persistModels(models); renderGallery(); });
+        el.appendChild(img); el.appendChild(info); el.appendChild(btns);
+        galleryList.appendChild(el);
+      }
+    };
+
+    const recordModel = (id, items, meta) => {
+      const rec = {
+        dx: meta.dx, dy: meta.dy, dz: meta.dz,
+        origin: meta.origin, delay: meta.delay, retries: meta.retries, move: meta.move,
+        size: meta.size, up: meta.up, solid: meta.solid, colorMode: meta.colorMode, single: meta.single,
+        preview: meta.preview || '', blocks: encodeBlocks(items),
+      };
+      const existing = id ? models.find((a) => a.id === id) : null;
+      if (existing) Object.assign(existing, rec, { ts: Date.now() });
+      else models.unshift(Object.assign({ id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), name: `Model ${models.length + 1}`, ts: Date.now() }, rec));
+      if (models.length > 40) models = models.slice(0, 40);
+      persistModels(models);
+      renderGallery();
+    };
+
+    const redoModel = async (m) => {
+      if (printer.running) { alert('Printer is busy. Stop the current job first.'); return; }
+      if (!confirm(`Rebuild "${m.name}" (${m.dx}×${m.dy}×${m.dz}) at (${m.origin.x}, ${m.origin.y}, ${m.origin.z})?`)) return;
+      stagedItems = decodeBlocks(m.blocks || []);
+      currentVoxels = { voxels: new Map(), dx: m.dx, dy: m.dy, dz: m.dz, count: stagedItems.length, surfaceCount: stagedItems.length };
+      currentName = m.name || 'model';
+      redoId = m.id;
+      panel.querySelector('#m3d-ox').value = m.origin.x;
+      panel.querySelector('#m3d-oy').value = m.origin.y;
+      panel.querySelector('#m3d-oz').value = m.origin.z;
+      if (m.delay) panel.querySelector('#m3d-delay').value = m.delay;
+      if (m.retries) panel.querySelector('#m3d-retries').value = m.retries;
+      panel.querySelector('#m3d-move').checked = m.move !== false;
+      if (m.size) sizeInput.value = m.size;
+      if (m.up) upSel.value = m.up;
+      solidCheck.checked = !!m.solid;
+      if (m.colorMode) colorModeSel.value = m.colorMode;
+      if (m.single) singleSel.value = String(m.single);
+      updateColorRowState();
+      previewWrap.classList.add('visible');
+      dropzone.style.display = 'none';
+      previewInfo.innerHTML = `<strong>${currentName}</strong><br>${m.dx}×${m.dy}×${m.dz} blocks · ${stagedItems.length} total`;
+      if (m.preview) { const im = new Image(); im.onload = () => { try { previewCanvas.getContext('2d').drawImage(im, 0, 0, previewCanvas.width, previewCanvas.height); } catch (e) { } }; im.src = m.preview; }
+      startBtn.disabled = false;
+      switchTab('printer');
+      startBuild();
+    };
+
+    const cleanModel = async (m) => {
+      if (printer.running) { alert('Printer is busy. Stop the current job first.'); return; }
+      if (!confirm(`Quick-clean "${m.name}" (${m.dx}×${m.dy}×${m.dz}) at (${m.origin.x}, ${m.origin.y}, ${m.origin.z})?`)) return;
+      const delay = parseInt(panel.querySelector('#m3d-delay').value) || 180;
+      const move = panel.querySelector('#m3d-move').checked;
+      if (m.origin.y < 1 || m.origin.y + m.dy > WORLD_MAX_Y) { alert('Origin Y would exceed the world height. Adjust the origin first.'); return; }
+      switchTab('printer');
+      startBtn.style.display = 'none';
+      stopBtn.style.display = '';
+      await printer.clearBox(m.origin, m.dx, m.dy, m.dz, delay, move);
+      startBtn.style.display = '';
+      stopBtn.style.display = 'none';
+    };
+
+    panel.querySelectorAll('.m3d-tab').forEach((t) => t.addEventListener('click', () => switchTab(t.dataset.tab)));
+    panel.querySelector('#m3d-gallery-clearall').addEventListener('click', () => {
+      if (!models.length) return;
+      if (!confirm('Forget all saved models? (world blocks are not affected)')) return;
+      models = [];
+      persistModels(models);
+      renderGallery();
+    });
+    renderGallery();
+
     const startBuild = async () => {
-      if (!currentVoxels || printer.running) return;
+      if ((!currentVoxels && !stagedItems) || printer.running) return;
       if (!capturedWS || capturedWS.readyState !== 1) {
         alert('⚠️ Cannot start: Game WebSocket not captured yet.\n\nWait for the world to fully load, then try again.');
         return;
       }
 
       const mode = colorModeSel.value;
-      const delay = parseInt(panel.querySelector('#m3d-delay').value) || 50;
+      const delay = parseInt(panel.querySelector('#m3d-delay').value) || 180;
       const retries = parseInt(panel.querySelector('#m3d-retries').value) || 12;
       const move = panel.querySelector('#m3d-move').checked;
       const origin = getOrigin();
@@ -1600,35 +1900,40 @@
       }
 
       // Build the per-voxel block list
-      let pal = null;
-      if (mode === 'model') {
-        if (!fullPalette) {
-          previewInfo.textContent = 'Loading block palette… 0%';
-          try {
-            pal = await buildFullPalette((d, t) => { previewInfo.textContent = `Loading block palette… ${Math.round((d / t) * 100)}%`; });
-          } catch (e) {
-            alert('Could not load all-blocks palette: ' + e.message + '\nFalling back to the 16 wools.');
-            pal = { rgb: WOOL_RGB, ids: WOOL_IDS_KNOWN, all: false };
+      let items;
+      if (stagedItems) {
+        items = stagedItems;
+      } else {
+        let pal = null;
+        if (mode === 'model') {
+          if (!fullPalette) {
+            previewInfo.textContent = 'Loading block palette… 0%';
+            try {
+              pal = await buildFullPalette((d, t) => { previewInfo.textContent = `Loading block palette… ${Math.round((d / t) * 100)}%`; });
+            } catch (e) {
+              alert('Could not load all-blocks palette: ' + e.message + '\nFalling back to the 16 wools.');
+              pal = { rgb: WOOL_RGB, ids: WOOL_IDS_KNOWN, all: false };
+            }
+          } else {
+            pal = fullPalette;
           }
-        } else {
-          pal = fullPalette;
+          pal = sanitizePalette(pal);
         }
-        pal = sanitizePalette(pal);
-      }
 
-      const items = [];
-      for (const [k, col] of currentVoxels.voxels) {
-        const z = k % 4096;
-        const y = Math.floor(k / 4096) % 4096;
-        const x = Math.floor(k / (4096 * 4096));
-        let blockId;
-        if (mode === 'single') {
-          blockId = parseInt(singleSel.value) || 47;
-        } else {
-          const c = col || [150, 150, 150];
-          blockId = pal.ids[nearestPaletteIndex(c[0], c[1], c[2], pal)];
+        items = [];
+        for (const [k, col] of currentVoxels.voxels) {
+          const z = k % 4096;
+          const y = Math.floor(k / 4096) % 4096;
+          const x = Math.floor(k / (4096 * 4096));
+          let blockId;
+          if (mode === 'single') {
+            blockId = parseInt(singleSel.value) || 47;
+          } else {
+            const c = col || [150, 150, 150];
+            blockId = pal.ids[nearestPaletteIndex(c[0], c[1], c[2], pal)];
+          }
+          items.push({ x, y, z, blockId });
         }
-        items.push({ x, y, z, blockId });
       }
 
       startBtn.style.display = 'none';
@@ -1641,6 +1946,22 @@
       pauseBtn.style.display = 'none';
       stopBtn.style.display = 'none';
       updateStatusUI();
+
+      if (!printer._cancel && items.length) {
+        recordModel(redoId, items, {
+          preview: modelThumbnail(),
+          dx: currentVoxels ? currentVoxels.dx : 0,
+          dy: currentVoxels ? currentVoxels.dy : 0,
+          dz: currentVoxels ? currentVoxels.dz : 0,
+          origin, delay, retries, move,
+          size: parseInt(sizeInput.value) || 48,
+          up: upSel.value,
+          solid: solidCheck.checked,
+          colorMode: colorModeSel.value,
+          single: parseInt(singleSel.value) || 47,
+        });
+      }
+      redoId = null;
     };
 
     startBtn.addEventListener('click', startBuild);
@@ -1667,7 +1988,7 @@
         alert('Origin Y would exceed the world height. Adjust the origin first.');
         return;
       }
-      const delay = parseInt(panel.querySelector('#m3d-delay').value) || 50;
+      const delay = parseInt(panel.querySelector('#m3d-delay').value) || 180;
       const move = panel.querySelector('#m3d-move').checked;
       startBtn.style.display = 'none';
       stopBtn.style.display = '';
