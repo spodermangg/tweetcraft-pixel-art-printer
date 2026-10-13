@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TweetCraft Pixel Art Printer
 // @namespace    https://tweetcraft.jai.vin
-// @version      1.6.6
+// @version      1.6.7
 // @description  Upload an image → auto-convert to wool colors → print pixel art like a bot (moves left→right, places blocks, fixes missed blocks per line)
 // @author       @vibecodingonsol
 // @match        https://tweetcraft.jai.vin/r/*
@@ -829,7 +829,7 @@
       this.blockIds = [...woolBlockIds];
       this.origin = { x: 0, y: 64, z: 0 };
       this.direction = 'north';
-      this.sweepMode = 'ltr'; // 'ltr' (printer) or 'zigzag'
+      this.sweepMode = 'zigzag'; // 'ltr' (printer) or 'zigzag'
       this.movePlayer = true;
       this.standoff = 2.5;
       this.delayMs = 180;
@@ -1354,6 +1354,13 @@
           height: 16px;
           cursor: pointer;
         }
+        .pa-note {
+          font-size: 10px;
+          color: #fbbf24;
+          line-height: 1.35;
+          margin: -4px 0 8px;
+          padding-left: 90px;
+        }
 
         .pa-coord-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-bottom: 8px; }
         .pa-coord-row label { font-size: 11px; color: rgba(255, 255, 255, 0.45); text-align: center; display: block; margin-bottom: 3px; }
@@ -1553,7 +1560,7 @@
 
       <div id="pa-header">
         <div class="title-wrap">
-          <div class="title"><span>🖨️</span> Pixel Art Printer <span style="font-size:10px; color:#c084fc; background:rgba(147,51,234,0.3); padding:2px 6px; border-radius:10px;">v1.6.6</span></div>
+          <div class="title"><span>🖨️</span> Pixel Art Printer <span style="font-size:10px; color:#c084fc; background:rgba(147,51,234,0.3); padding:2px 6px; border-radius:10px;">v1.6.7</span></div>
           <div class="byline">by @vibecodingonsol</div>
         </div>
         <button id="pa-toggle-btn">▾</button>
@@ -1599,8 +1606,9 @@
           </div>
           <div class="pa-row">
             <label>Delay (ms)</label>
-            <input type="number" id="pa-delay" value="180" min="10" max="2000" step="5">
+            <input type="number" id="pa-delay" value="180" min="10" max="2000" step="5" title="180 ms is tested working — lower values may cause the server to drop blocks">
           </div>
+          <div class="pa-note">⚠️ 180 ms is tested working. Lower values may cause the server to silently drop blocks (results vary with server load).</div>
           <div class="pa-row">
             <label>Line Retries</label>
             <input type="number" id="pa-retries" value="30" min="1" max="60" step="1" title="Sweeps to fix missed/leftover blocks before moving to the next line (used for both building and cleaning)">
@@ -1619,7 +1627,7 @@
             <label>Carriage Mode</label>
             <select id="pa-mode">
               <option value="ltr">Left → Right (Printer sweep)</option>
-              <option value="zigzag">Zig-zag (Bidirectional)</option>
+              <option value="zigzag" selected>Zig-zag (Bidirectional)</option>
             </select>
           </div>
           <div class="pa-row">
