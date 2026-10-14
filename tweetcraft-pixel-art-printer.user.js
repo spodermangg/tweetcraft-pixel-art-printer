@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TweetCraft Pixel Art Printer
 // @namespace    https://tweetcraft.jai.vin
-// @version      1.7.2
+// @version      1.8.3
 // @description  Upload an image → auto-convert to wool colors → print pixel art like a bot (moves left→right, places blocks, fixes missed blocks per line)
 // @author       @vibecodingonsol
 // @match        https://tweetcraft.jai.vin/r/*
@@ -392,12 +392,15 @@
     targetWindow.__pixelArtSending = true;
     try {
       if (blockId === 0) {
-        // Clearing a block: the server removes blocks via the dig flow. Best-effort:
-        // send a start+done dig on the target (creative rooms accept this as air).
+        // Clearing a block: the server removes blocks via the dig flow. The game
+        // uses a UNIQUE incrementing sequence `i` per dig (++digSeq) to correlate
+        // the start/done stages; reusing one value makes the server ignore later
+        // digs as stale, which is why some support blocks survived cleanup.
+        const seq = ++digSeqCounter;
         ws.send(JSON.stringify({ t: 'inv', hotbar: [0, 0, 0, 0, 0, 0, 0, 0, 0], slot: 0 }));
         ws.send(buildPosPacket(ix + 0.5, iy + 0.5, iz + 0.5));
-        ws.send(JSON.stringify({ t: 'dig', s: 0, x: ix, y: iy, z: iz, f: 1, i: 1 }));
-        ws.send(JSON.stringify({ t: 'dig', s: 2, x: ix, y: iy, z: iz, f: 1, i: 1 }));
+        ws.send(JSON.stringify({ t: 'dig', s: 0, x: ix, y: iy, z: iz, f: 1, i: seq }));
+        ws.send(JSON.stringify({ t: 'dig', s: 2, x: ix, y: iy, z: iz, f: 1, i: seq }));
         sentEdits.set(editKey(ix, iy, iz), 0);
         packetsSentCount++;
         return true;
@@ -452,12 +455,42 @@
     }
   }
 
-  function placeBlock(x, y, z, blockId) {
+  // Mine out the block currently at (x,y,z) so a different block can be placed
+  // there. Sends the game's dig flow (start + done) and waits briefly for the
+  // server to process it before the caller places the new block.
+  async function clearCell(x, y, z) {
+    if (!capturedWS || capturedWS.readyState !== 1) return;
+    const mc = targetWindow.__mc || window.__mc;
+    const seq = ++digSeqCounter;
+    console.log(`[PixelArt] Pre-clearing existing block at (${x}, ${y}, ${z})`);
+    targetWindow.__pixelArtSending = true;
+    try {
+      capturedWS.send(JSON.stringify({ t: 'inv', hotbar: [0, 0, 0, 0, 0, 0, 0, 0, 0], slot: 0 }));
+      capturedWS.send(buildPosPacket(x + 0.5, y + 0.5, z + 0.5));
+      capturedWS.send(JSON.stringify({ t: 'dig', s: 0, x, y, z, f: 1, i: seq }));
+      capturedWS.send(JSON.stringify({ t: 'dig', s: 2, x, y, z, f: 1, i: seq }));
+    } catch (e) {
+      console.warn('[PixelArt] Pre-clear dig failed:', e);
+    }
+    targetWindow.__pixelArtSending = false;
+    sentEdits.set(editKey(x, y, z), 0);
+    if (mc && mc.eng && mc.eng.x) mc.eng.x.set_block(x, y, z, 0);
+    else if (wasmExports && typeof wasmExports.set_block === 'function') wasmExports.set_block(x, y, z, 0);
+    await new Promise((r) => setTimeout(r, 120));
+  }
+
+  async function placeBlock(x, y, z, blockId) {
     const blockName = getBlockName(blockId);
     if (blockId === 0) {
       console.log(`[PixelArt] Clearing (air) at (${x}, ${y}, ${z})`);
     } else {
       console.log(`[PixelArt] Placing ${blockName} (id ${blockId}) at (${x}, ${y}, ${z})`);
+      // If a different block already occupies this cell, mine it out first so the
+      // new block can be placed there.
+      const existing = getBlock(x, y, z);
+      if (existing > 0 && existing !== 255 && existing !== blockId) {
+        await clearCell(x, y, z);
+      }
     }
 
     // 1. MUST successfully send across the real WebSocket
@@ -632,6 +665,32 @@
   // Wool instead. Add more names here if they cause the same problem.
   const BLACK_WOOL_ID = 62;
   const WINDOW_BLOCK_RE = /furnace|crafting table|chest/i;
+  // Temporary support pillars let the printer place art in mid-air. The game only
+  // lets you place a block against an existing solid block (client raycast), so
+  // sky art needs a scaffold built up from the ground. The pillars are removed
+  // again once the art is placed.
+  const SCAFFOLD_BLOCK_NAME = /^dirt$/i;
+  let scaffoldBlockId = null; // resolved lazily from the engine's block names
+  let digSeqCounter = 0;      // sequence id for pre-clear digs
+
+  function getScaffoldBlockId() {
+    if (scaffoldBlockId != null) return scaffoldBlockId;
+    const data = getBlockData();
+    if (data && data.blockNames) {
+      for (let i = 1; i < data.blockNames.length; i++) {
+        if (SCAFFOLD_BLOCK_NAME.test(String(data.blockNames[i] || ''))) { scaffoldBlockId = i; break; }
+      }
+    }
+    if (scaffoldBlockId == null) scaffoldBlockId = 1; // fallback: Stone
+    return scaffoldBlockId;
+  }
+
+  function getScaffoldBlockName() {
+    const data = getBlockData();
+    const id = getScaffoldBlockId();
+    return (data && data.blockNames && data.blockNames[id]) || `#${id}`;
+  }
+
   let fullPalette = null;
   let fullPalettePromise = null;
 
@@ -1011,25 +1070,104 @@
       }
     }
 
-    _playerCoords(col, rowFromBottom) {
-      const b = this._blockCoords(col, rowFromBottom);
+    _playerPosForBlock(bx, by, bz) {
       switch (this.direction) {
         case 'north':
-          return { x: b.x + 0.5, y: b.y, z: b.z + this.standoff };
+          return { x: bx + 0.5, y: by, z: bz + this.standoff };
         case 'south':
-          return { x: b.x + 0.5, y: b.y, z: b.z - this.standoff };
+          return { x: bx + 0.5, y: by, z: bz - this.standoff };
         case 'east':
-          return { x: b.x - this.standoff, y: b.y, z: b.z + 0.5 };
+          return { x: bx - this.standoff, y: by, z: bz + 0.5 };
         case 'west':
-          return { x: b.x + this.standoff, y: b.y, z: b.z + 0.5 };
+          return { x: bx + this.standoff, y: by, z: bz + 0.5 };
         case 'floor':
-          return { x: b.x + 0.5, y: b.y + this.standoff, z: b.z + 0.5 };
+          return { x: bx + 0.5, y: by + this.standoff, z: bz + 0.5 };
         default:
-          return { x: b.x + 0.5, y: b.y, z: b.z + this.standoff };
+          return { x: bx + 0.5, y: by, z: bz + this.standoff };
       }
     }
 
-    async start(grid, w, h, origin, direction, delayMs, lineRetries, sweepMode, movePlayer, blockIds) {
+    _playerCoords(col, rowFromBottom) {
+      const b = this._blockCoords(col, rowFromBottom);
+      return this._playerPosForBlock(b.x, b.y, b.z);
+    }
+
+    // Is there an art block at grid (row, col)? row is "from bottom".
+    _hasArt(row, col) {
+      if (row < 0 || row >= this.h || col < 0 || col >= this.w) return false;
+      const woolIdx = this.grid[this.h - 1 - row][col];
+      if (woolIdx < 0) return false;
+      const blockId = this.blockIds[woolIdx];
+      return blockId != null && blockId >= 0;
+    }
+
+    // A block needs external support only if it has no already-placed neighbour:
+    // the block below (previous row) or the neighbour placed just before it in
+    // the sweep order. Everything else chains off the art itself.
+    _needsSupport(row, col) {
+      if (this._hasArt(row - 1, col)) return false;          // something below
+      const rtl = this.sweepMode === 'zigzag' && (row % 2) === 1;
+      const hc = rtl ? col + 1 : col - 1;
+      if (this._hasArt(row, hc)) return false;               // earlier horizontal neighbour
+      return true;
+    }
+
+    // Build the shortest pillar from the nearest solid block up to just below
+    // (col,row), so the art block has something to place against. Called on
+    // demand during printing, so the pillar may rest on already-placed art.
+    async _ensureSupport(col, row) {
+      const b = this._blockCoords(col, row);
+      let gy = -1;
+      for (let y = b.y - 1; y >= 0; y--) {
+        const blk = getBlock(b.x, y, b.z);
+        if (blk > 0 && blk !== 255) { gy = y; break; }
+      }
+      if (gy < 0) {
+        console.warn(`[PixelArt] No support below (${b.x}, ${b.z}) — block at y=${b.y} may not print.`);
+        return;
+      }
+      const blockId = getScaffoldBlockId();
+      for (let y = gy + 1; y <= b.y - 1; y++) {
+        await this._waitUnpaused();
+        if (this._cancel) return;
+        if (this.movePlayer) {
+          const pp = this._playerPosForBlock(b.x, y, b.z);
+          movePlayer(pp.x, pp.y, pp.z);
+        }
+        await placeBlock(b.x, y, b.z, blockId);
+        this._scaffoldPlaced.push({ x: b.x, y, z: b.z });
+        this._hadScaffold = true;
+        await this._sleep(this.delayMs);
+      }
+    }
+
+    // Tear the support pillars back down (top-down), leaving the art in the air.
+    async _removeScaffold() {
+      const pads = this._scaffoldPlaced || [];
+      if (!pads.length) return;
+      console.log(`[PixelArt] Removing ${pads.length} support block(s).`);
+      this.progress.status = `Removing ${pads.length} support block(s)…`;
+      this._notify();
+      const ordered = [...pads].sort((a, b) => b.y - a.y); // top-down
+      // Digs are rate-limited (~200ms) more aggressively than placements, and we
+      // get no acks, so use a slower cadence and run two passes to catch drops.
+      const digDelay = Math.max(this.delayMs, 200);
+      for (let pass = 0; pass < 2 && !this._cancel; pass++) {
+        for (const p of ordered) {
+          await this._waitUnpaused();
+          if (this._cancel) return;
+          if (this.movePlayer) {
+            const pp = this._playerPosForBlock(p.x, p.y, p.z);
+            movePlayer(pp.x, pp.y, pp.z);
+          }
+          await placeBlock(p.x, p.y, p.z, 0);
+          await this._sleep(digDelay);
+        }
+      }
+      this._scaffoldPlaced = [];
+    }
+
+    async start(grid, w, h, origin, direction, delayMs, lineRetries, sweepMode, movePlayer, blockIds, scaffold) {
       this.grid = grid;
       this.w = w;
       this.h = h;
@@ -1040,6 +1178,9 @@
       this.sweepMode = sweepMode;
       this.movePlayer = movePlayer;
       this.blockIds = blockIds && blockIds.length ? blockIds : woolBlockIds;
+      this.scaffold = !!scaffold;
+      this._scaffoldPlaced = [];
+      this._hadScaffold = false;
       this.running = true;
       this.paused = false;
       this._cancel = false;
@@ -1048,10 +1189,17 @@
       this.progress = { row: 0, col: 0, placed: 0, total: totalBlocks, status: 'Starting printer...' };
       this._notify();
 
+      this._scaffoldPlaced = [];
+      this._hadScaffold = false;
+
       await this._printAll();
 
+      if (this.scaffold && !this._cancel) await this._removeScaffold();
+
       if (!this._cancel) {
-        this.progress.status = '✅ Printing complete! All blocks sent to server.';
+        this.progress.status = this._hadScaffold
+          ? '✅ Printing complete! (support pillars are removed best-effort — check for leftovers)'
+          : '✅ Printing complete! All blocks sent to server.';
         this._notify();
       }
       this.running = false;
@@ -1098,7 +1246,7 @@
             movePlayer(pPos.x, pPos.y, pPos.z);
           }
 
-          placeBlock(bPos.x, bPos.y, bPos.z, 0); // 0 = Air
+          await placeBlock(bPos.x, bPos.y, bPos.z, 0); // 0 = Air
           this.progress.placed++;
           this.progress.col = c;
           this._notify();
@@ -1134,7 +1282,7 @@
                 movePlayer(pPos.x, pPos.y, pPos.z);
               }
 
-              placeBlock(bPos.x, bPos.y, bPos.z, 0);
+              await placeBlock(bPos.x, bPos.y, bPos.z, 0);
               await this._sleep(delayMs);
             }
           }
@@ -1182,6 +1330,11 @@
           const blockId = this.blockIds[woolIdx];
           if (blockId == null || blockId < 0) continue;
 
+          if (this.scaffold && this._needsSupport(rowFromBottom, col)) {
+            await this._ensureSupport(col, rowFromBottom);
+            if (this._cancel) return;
+          }
+
           const bPos = this._blockCoords(col, rowFromBottom);
 
           // Move player carriage with printer
@@ -1190,7 +1343,7 @@
             movePlayer(pPos.x, pPos.y, pPos.z);
           }
 
-          const placedOk = placeBlock(bPos.x, bPos.y, bPos.z, blockId);
+          const placedOk = await placeBlock(bPos.x, bPos.y, bPos.z, blockId);
           if (!placedOk) {
             // Abort if socket transmission failed
             return;
@@ -1244,7 +1397,7 @@
                 movePlayer(pPos.x, pPos.y, pPos.z);
               }
 
-              placeBlock(bPos.x, bPos.y, bPos.z, blockId);
+              await placeBlock(bPos.x, bPos.y, bPos.z, blockId);
               await this._sleep(this.delayMs);
             }
           }
@@ -1698,7 +1851,7 @@
 
       <div id="pa-header">
         <div class="title-wrap">
-          <div class="title"><span>🖨️</span> Pixel Art Printer <span style="font-size:10px; color:#c084fc; background:rgba(147,51,234,0.3); padding:2px 6px; border-radius:10px;">v1.7.2</span></div>
+          <div class="title"><span>🖨️</span> Pixel Art Printer <span style="font-size:10px; color:#c084fc; background:rgba(147,51,234,0.3); padding:2px 6px; border-radius:10px;">v1.8.1</span></div>
           <div class="byline">by @vibecodingonsol</div>
         </div>
         <button id="pa-toggle-btn">▾</button>
@@ -1772,6 +1925,11 @@
             <label>Move Player</label>
             <input type="checkbox" id="pa-move-player" checked title="Player moves like the printer carriage">
             <span style="font-size:11px; color:rgba(255,255,255,0.45); margin-left:6px;">Follow printer carriage</span>
+          </div>
+          <div class="pa-row">
+            <label>Support Pillars</label>
+            <input type="checkbox" id="pa-scaffold" checked title="The game only lets you place a block against an existing solid block. For art in mid-air, add the fewest temporary support blocks needed (a single pillar under the first block of a run — the rest chain onto the art), then remove them after printing. No effect when the art already rests on the ground.">
+            <span id="pa-scaffold-info" style="font-size:11px; color:rgba(255,255,255,0.45); margin-left:6px;">Sky art: minimal support + clean up</span>
           </div>
           <div class="pa-row">
             <label>Dithering</label>
@@ -2131,6 +2289,7 @@
       const retries = parseInt(panel.querySelector('#pa-retries').value) || 30;
       const mode = panel.querySelector('#pa-mode').value;
       const movePlayerOpt = panel.querySelector('#pa-move-player').checked;
+      const scaffoldOpt = panel.querySelector('#pa-scaffold').checked;
       const pal = activePalette;
 
       // Height check: walls grow upward from origin.y, floors stay at origin.y.
@@ -2151,14 +2310,14 @@
       pauseBtn.style.display = '';
       stopBtn.style.display = '';
 
-      await printer.start(currentGrid, currentW, currentH, origin, dir, delay, retries, mode, movePlayerOpt, pal.ids);
+      await printer.start(currentGrid, currentW, currentH, origin, dir, delay, retries, mode, movePlayerOpt, pal.ids, scaffoldOpt);
 
       startBtn.style.display = '';
       pauseBtn.style.display = 'none';
       stopBtn.style.display = 'none';
 
       if (!printer._cancel) {
-        recordArtwork(redoId || null, currentGrid, currentW, currentH, origin, dir, delay, retries, mode, movePlayerOpt, pal);
+        recordArtwork(redoId || null, currentGrid, currentW, currentH, origin, dir, delay, retries, mode, movePlayerOpt, pal, scaffoldOpt);
       }
     };
 
@@ -2171,7 +2330,7 @@
       stopBtn.style.display = 'none';
     };
 
-    const recordArtwork = (id, grid, w, h, origin, direction, delay, retries, mode, movePlayerOpt, pal) => {
+    const recordArtwork = (id, grid, w, h, origin, direction, delay, retries, mode, movePlayerOpt, pal, scaffoldOpt) => {
       const palette = (pal && pal.rgb) ? pal : activePalette;
       const preview = gridThumbnail(grid, w, h, palette);
       const packed = encodeGrid(grid);
@@ -2186,12 +2345,14 @@
         existing.origin = origin; existing.direction = direction;
         existing.delayMs = delay; existing.retries = retries;
         existing.sweepMode = mode; existing.movePlayer = movePlayerOpt;
+        existing.scaffold = scaffoldOpt !== false;
       } else {
         artworks.unshift({
           id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
           name: `Artwork ${artworks.length + 1}`,
           ts: Date.now(), w, h, origin, direction,
           delayMs: delay, retries, sweepMode: mode, movePlayer: movePlayerOpt,
+          scaffold: scaffoldOpt !== false,
           preview, grid: packed, palette: paletteRec,
         });
       }
@@ -2231,6 +2392,7 @@
       panel.querySelector('#pa-dir').value = art.direction || 'north';
       panel.querySelector('#pa-mode').value = art.sweepMode || 'ltr';
       panel.querySelector('#pa-move-player').checked = art.movePlayer !== false;
+      panel.querySelector('#pa-scaffold').checked = art.scaffold !== false;
       if (art.delayMs) panel.querySelector('#pa-delay').value = art.delayMs;
       if (art.retries) panel.querySelector('#pa-retries').value = art.retries;
 
@@ -2314,6 +2476,9 @@
     await new Promise((r) => setTimeout(r, 1500));
 
     discoverWoolIds();
+
+    const scaffoldInfoEl = document.getElementById('pa-scaffold-info');
+    if (scaffoldInfoEl) scaffoldInfoEl.textContent = `Sky art: minimal support with ${getScaffoldBlockName()}, then remove`;
 
     const printer = new PixelPrinter();
     createUI(printer);
