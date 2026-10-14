@@ -832,7 +832,7 @@
       this.sweepMode = 'zigzag'; // 'ltr' (printer) or 'zigzag'
       this.movePlayer = true;
       this.standoff = 2.5;
-      this.delayMs = 180;
+      this.delayMs = 50;
       this.lineRetries = 30;
       this.progress = { row: 0, col: 0, placed: 0, total: 0, status: '' };
       this.onProgress = null;
