@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TweetCraft Pixel Art Printer
 // @namespace    https://tweetcraft.jai.vin
-// @version      1.7.0
+// @version      1.7.1
 // @description  Upload an image → auto-convert to wool colors → print pixel art like a bot (moves left→right, places blocks, fixes missed blocks per line)
 // @author       @vibecodingonsol
 // @match        https://tweetcraft.jai.vin/r/*
@@ -960,7 +960,7 @@
       this.sweepMode = 'zigzag'; // 'ltr' (printer) or 'zigzag'
       this.movePlayer = true;
       this.standoff = 2.5;
-      this.delayMs = 180;
+      this.delayMs = 45;
       this.lineRetries = 30;
       this.progress = { row: 0, col: 0, placed: 0, total: 0, status: '' };
       this.onProgress = null;
@@ -1105,44 +1105,39 @@
           await this._sleep(delayMs);
         }
 
-        // 2. Line verification & retry BEFORE moving to next line.
-        //    Verify against mirrored server acks; the local world is optimistic
-        //    and cannot reveal silently dropped digs.
-        await this._sleep(250);
+        // 2. Line verification & retry BEFORE moving to next line, only when the
+        //    server acks our edits. With no feedback there's nothing to verify,
+        //    so skip it (avoids clearing each row twice).
         const clearUseServerTruth = acksSeen > 0;
-        const clearMaxPasses = clearUseServerTruth ? this.lineRetries : 1;
-        for (let retry = 1; retry <= clearMaxPasses && !this._cancel; retry++) {
-          const missingCols = [];
-          for (let c = 0; c < w; c++) {
-            const bPos = this._blockCoords(c, r);
-            if (clearUseServerTruth) {
+        if (clearUseServerTruth) {
+          await this._sleep(250);
+          for (let retry = 1; retry <= this.lineRetries && !this._cancel; retry++) {
+            const missingCols = [];
+            for (let c = 0; c < w; c++) {
+              const bPos = this._blockCoords(c, r);
               if (!serverConfirmed(bPos.x, bPos.y, bPos.z, 0)) missingCols.push(c);
-            } else {
-              missingCols.push(c);
-            }
-          }
-
-          if (missingCols.length === 0) break;
-
-          this.progress.status = `Row ${currentLineNum}: re-clearing ${missingCols.length} remaining blocks (pass ${retry})...`;
-          this._notify();
-
-          for (const c of missingCols) {
-            await this._waitUnpaused();
-            if (this._cancel) return;
-
-            const bPos = this._blockCoords(c, r);
-
-            if (this.movePlayer) {
-              const pPos = this._playerCoords(c, r);
-              movePlayer(pPos.x, pPos.y, pPos.z);
             }
 
-            placeBlock(bPos.x, bPos.y, bPos.z, 0);
-            await this._sleep(delayMs);
-          }
+            if (missingCols.length === 0) break;
 
-          if (!clearUseServerTruth) await this._sleep(250);
+            this.progress.status = `Row ${currentLineNum}: re-clearing ${missingCols.length} remaining blocks (pass ${retry})...`;
+            this._notify();
+
+            for (const c of missingCols) {
+              await this._waitUnpaused();
+              if (this._cancel) return;
+
+              const bPos = this._blockCoords(c, r);
+
+              if (this.movePlayer) {
+                const pPos = this._playerCoords(c, r);
+                movePlayer(pPos.x, pPos.y, pPos.z);
+              }
+
+              placeBlock(bPos.x, bPos.y, bPos.z, 0);
+              await this._sleep(delayMs);
+            }
+          }
         }
 
         await this._sleep(60);
@@ -1208,58 +1203,51 @@
           await this._sleep(this.delayMs);
         }
 
-        // 2. Line verification & retry BEFORE moving to next line.
-        //    The local world updates optimistically, so it can't reveal blocks
-        //    the server silently dropped. Verify against mirrored server acks
-        //    (placeack / relay). If the server never acks our edits at all,
-        //    fall back to a single forced re-send of the whole row.
-        await this._sleep(250);
+        // 2. Line verification & retry BEFORE moving to next line, but only if
+        //    the server actually acknowledges our edits (acksSeen > 0). The
+        //    local world updates optimistically, so it can't reveal silently
+        //    dropped blocks. With no server acks there is nothing to verify
+        //    against, so we skip the pass entirely (avoids printing each row twice).
         const useServerTruth = acksSeen > 0;
         if (!useServerTruth && currentLineNum === 1) {
-          console.warn('[PixelArt] ⚠️ No server acks seen — falling back to blindly re-sending each row. (Server may not acknowledge raw place packets.)');
+          console.warn('[PixelArt] No server acks seen — skipping per-row verification (no feedback to verify against).');
         }
-        const maxPasses = useServerTruth ? this.lineRetries : 1;
-        for (let retry = 1; retry <= maxPasses && !this._cancel; retry++) {
-          const missingCols = [];
-          for (let col = 0; col < this.w; col++) {
-            const woolIdx = this.grid[imgRow][col];
-            if (woolIdx < 0) continue;
-            const blockId = this.blockIds[woolIdx];
-            const bPos = this._blockCoords(col, rowFromBottom);
-            if (useServerTruth) {
+        if (useServerTruth) {
+          await this._sleep(250);
+          for (let retry = 1; retry <= this.lineRetries && !this._cancel; retry++) {
+            const missingCols = [];
+            for (let col = 0; col < this.w; col++) {
+              const woolIdx = this.grid[imgRow][col];
+              if (woolIdx < 0) continue;
+              const blockId = this.blockIds[woolIdx];
+              const bPos = this._blockCoords(col, rowFromBottom);
               if (!serverConfirmed(bPos.x, bPos.y, bPos.z, blockId)) missingCols.push(col);
-            } else {
-              missingCols.push(col); // no server feedback: blindly re-send once
-            }
-          }
-
-          if (missingCols.length === 0) {
-            break;
-          }
-
-          this.progress.status = useServerTruth
-            ? `Row ${currentLineNum}: fixing ${missingCols.length} unconfirmed blocks (pass ${retry})...`
-            : `Row ${currentLineNum}: re-sending row (${missingCols.length} blocks, no server acks yet)...`;
-          this._notify();
-
-          for (const col of missingCols) {
-            await this._waitUnpaused();
-            if (this._cancel) return;
-
-            const woolIdx = this.grid[imgRow][col];
-            const blockId = this.blockIds[woolIdx];
-            const bPos = this._blockCoords(col, rowFromBottom);
-
-            if (this.movePlayer) {
-              const pPos = this._playerCoords(col, rowFromBottom);
-              movePlayer(pPos.x, pPos.y, pPos.z);
             }
 
-            placeBlock(bPos.x, bPos.y, bPos.z, blockId);
-            await this._sleep(this.delayMs);
-          }
+            if (missingCols.length === 0) {
+              break;
+            }
 
-          if (!useServerTruth) await this._sleep(250);
+            this.progress.status = `Row ${currentLineNum}: fixing ${missingCols.length} unconfirmed blocks (pass ${retry})...`;
+            this._notify();
+
+            for (const col of missingCols) {
+              await this._waitUnpaused();
+              if (this._cancel) return;
+
+              const woolIdx = this.grid[imgRow][col];
+              const blockId = this.blockIds[woolIdx];
+              const bPos = this._blockCoords(col, rowFromBottom);
+
+              if (this.movePlayer) {
+                const pPos = this._playerCoords(col, rowFromBottom);
+                movePlayer(pPos.x, pPos.y, pPos.z);
+              }
+
+              placeBlock(bPos.x, bPos.y, bPos.z, blockId);
+              await this._sleep(this.delayMs);
+            }
+          }
         }
 
         console.log(`[PIXEL-DEBUG] Row ${currentLineNum} done | serverTruth=${useServerTruth} | acksSeen=${acksSeen}`);
@@ -1710,7 +1698,7 @@
 
       <div id="pa-header">
         <div class="title-wrap">
-          <div class="title"><span>🖨️</span> Pixel Art Printer <span style="font-size:10px; color:#c084fc; background:rgba(147,51,234,0.3); padding:2px 6px; border-radius:10px;">v1.7.0</span></div>
+          <div class="title"><span>🖨️</span> Pixel Art Printer <span style="font-size:10px; color:#c084fc; background:rgba(147,51,234,0.3); padding:2px 6px; border-radius:10px;">v1.7.1</span></div>
           <div class="byline">by @vibecodingonsol</div>
         </div>
         <button id="pa-toggle-btn">▾</button>
