@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TweetCraft Pixel Art Printer
 // @namespace    https://tweetcraft.jai.vin
-// @version      1.8.3
+// @version      1.8.4
 // @description  Upload an image → auto-convert to wool colors → print pixel art like a bot (moves left→right, places blocks, fixes missed blocks per line)
 // @author       @vibecodingonsol
 // @match        https://tweetcraft.jai.vin/r/*
@@ -1333,6 +1333,8 @@
           if (this.scaffold && this._needsSupport(rowFromBottom, col)) {
             await this._ensureSupport(col, rowFromBottom);
             if (this._cancel) return;
+            // Let the server register the fresh support before we place against it.
+            await this._sleep(Math.max(this.delayMs, 120));
           }
 
           const bPos = this._blockCoords(col, rowFromBottom);
@@ -1367,6 +1369,8 @@
         }
         if (useServerTruth) {
           await this._sleep(250);
+          let prevMissing = Infinity;
+          let stagnant = 0;
           for (let retry = 1; retry <= this.lineRetries && !this._cancel; retry++) {
             const missingCols = [];
             for (let col = 0; col < this.w; col++) {
@@ -1380,6 +1384,19 @@
             if (missingCols.length === 0) {
               break;
             }
+
+            // Bail out if a retry pass confirms nothing new — otherwise an
+            // un-acked block (rate limit / rejected placement) makes us re-place
+            // the SAME row until the retry budget runs out. Move on instead.
+            if (missingCols.length >= prevMissing) {
+              if (++stagnant >= 2) {
+                console.warn(`[PixelArt] Row ${currentLineNum}: still ${missingCols.length} unconfirmed block(s) after ${retry - 1} retr${retry - 1 === 1 ? 'y' : 'ies'} with no progress — moving on. Raise Delay if blocks are being dropped by the server.`);
+                break;
+              }
+            } else {
+              stagnant = 0;
+            }
+            prevMissing = missingCols.length;
 
             this.progress.status = `Row ${currentLineNum}: fixing ${missingCols.length} unconfirmed blocks (pass ${retry})...`;
             this._notify();
