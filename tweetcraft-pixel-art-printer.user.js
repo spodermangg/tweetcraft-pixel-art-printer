@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TweetCraft Pixel Art Printer
 // @namespace    https://tweetcraft.jai.vin
-// @version      1.7.1
+// @version      1.7.2
 // @description  Upload an image → auto-convert to wool colors → print pixel art like a bot (moves left→right, places blocks, fixes missed blocks per line)
 // @author       @vibecodingonsol
 // @match        https://tweetcraft.jai.vin/r/*
@@ -957,7 +957,7 @@
       this.blockIds = [...woolBlockIds];
       this.origin = { x: 0, y: 64, z: 0 };
       this.direction = 'north';
-      this.sweepMode = 'zigzag'; // 'ltr' (printer) or 'zigzag'
+      this.sweepMode = 'ltr'; // 'ltr' (printer) or 'zigzag'
       this.movePlayer = true;
       this.standoff = 2.5;
       this.delayMs = 45;
@@ -1698,7 +1698,7 @@
 
       <div id="pa-header">
         <div class="title-wrap">
-          <div class="title"><span>🖨️</span> Pixel Art Printer <span style="font-size:10px; color:#c084fc; background:rgba(147,51,234,0.3); padding:2px 6px; border-radius:10px;">v1.7.1</span></div>
+          <div class="title"><span>🖨️</span> Pixel Art Printer <span style="font-size:10px; color:#c084fc; background:rgba(147,51,234,0.3); padding:2px 6px; border-radius:10px;">v1.7.2</span></div>
           <div class="byline">by @vibecodingonsol</div>
         </div>
         <button id="pa-toggle-btn">▾</button>
@@ -1744,9 +1744,9 @@
           </div>
           <div class="pa-row">
             <label>Delay (ms)</label>
-            <input type="number" id="pa-delay" value="180" min="10" max="2000" step="5" title="180 ms is tested working — lower values may cause the server to drop blocks">
+            <input type="number" id="pa-delay" value="45" min="10" max="2000" step="5" title="45 ms default — lower values may cause the server to drop blocks">
           </div>
-          <div class="pa-note">⚠️ 180 ms is tested working. Lower values may cause the server to silently drop blocks (results vary with server load).</div>
+          <div class="pa-note">⚠️ Default is 45 ms. Very low values may cause the server to silently drop blocks (results vary with server load).</div>
           <div class="pa-row">
             <label>Line Retries</label>
             <input type="number" id="pa-retries" value="30" min="1" max="60" step="1" title="Sweeps to fix missed/leftover blocks before moving to the next line (used for both building and cleaning)">
@@ -1764,8 +1764,8 @@
           <div class="pa-row">
             <label>Carriage Mode</label>
             <select id="pa-mode">
-              <option value="ltr">Left → Right (Printer sweep)</option>
-              <option value="zigzag" selected>Zig-zag (Bidirectional)</option>
+              <option value="ltr" selected>Left → Right (Printer sweep)</option>
+              <option value="zigzag">Zig-zag (Bidirectional)</option>
             </select>
           </div>
           <div class="pa-row">
@@ -2127,7 +2127,7 @@
 
       const origin = getOrigin();
       const dir = panel.querySelector('#pa-dir').value;
-      const delay = parseInt(panel.querySelector('#pa-delay').value) || 180;
+      const delay = parseInt(panel.querySelector('#pa-delay').value) || 45;
       const retries = parseInt(panel.querySelector('#pa-retries').value) || 30;
       const mode = panel.querySelector('#pa-mode').value;
       const movePlayerOpt = panel.querySelector('#pa-move-player').checked;
@@ -2242,7 +2242,7 @@
       if (printer.running) { alert('Printer is busy. Stop the current job first.'); return; }
       if (!confirm(`Quick-clean "${art.name}" (${art.w}×${art.h}) at (${art.origin.x}, ${art.origin.y}, ${art.origin.z})?`)) return;
 
-      const delay = parseInt(panel.querySelector('#pa-delay').value) || 180;
+      const delay = parseInt(panel.querySelector('#pa-delay').value) || 45;
       const retries = parseInt(panel.querySelector('#pa-retries').value) || 30;
       const followPlayer = panel.querySelector('#pa-move-player').checked;
       switchTab('printer');
@@ -2282,7 +2282,7 @@
 
       const origin = getOrigin();
       const dir = panel.querySelector('#pa-dir').value;
-      const delay = parseInt(panel.querySelector('#pa-delay').value) || 180;
+      const delay = parseInt(panel.querySelector('#pa-delay').value) || 45;
       const retries = parseInt(panel.querySelector('#pa-retries').value) || 30;
       const followPlayer = panel.querySelector('#pa-move-player').checked;
 
