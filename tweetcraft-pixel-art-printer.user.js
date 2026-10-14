@@ -28,6 +28,67 @@
   let lastSinv = null;
   let lastSelSlot = null;
 
+  /* ─────────────────────────────────────────────
+   * Server-state mirror (authoritative block truth)
+   * ─────────────────────────────────────────────
+   * The local WASM world is updated optimistically the moment we send a packet,
+   * so it can NEVER reveal a block the server silently dropped (rate limit /
+   * out of reach). The server DOES acknowledge every accepted placement with a
+   * JSON {"t":"placeack", x, y, z, b} message (see the game's PlacePrediction).
+   * We mirror those acks here so verification/retry reflects the real world.
+   */
+  const KEY_MASK = 0x3FF; // 10 bits per horizontal axis (1024 world)
+  const serverEdits = new Map(); // editKey -> blockId the server actually has
+  const sentEdits = new Map();   // editKey -> blockId we last asked the server to set
+  let acksSeen = 0;              // # of our own edits the server has acknowledged
+
+  function editKey(x, y, z) {
+    return (((x << 17) | (z << 7) | y) >>> 0);
+  }
+
+  // Decode server-authoritative edits from binary SYNC(3) / RELAY(5,6) frames,
+  // mirroring proto.js layouts. Complements the JSON placeack/digack handling.
+  function ingestServerEdits(data) {
+    let dv;
+    try {
+      if (data instanceof ArrayBuffer) dv = new DataView(data);
+      else if (data && data.buffer instanceof ArrayBuffer) dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      else return;
+    } catch (e) { return; }
+    if (dv.byteLength < 1) return;
+    const t = dv.getUint8(0);
+    if (t === 3) { // SYNC: 5-byte records (u32 key, u8 block)
+      const n = Math.floor((dv.byteLength - 1) / 5);
+      for (let i = 0; i < n; i++) {
+        const o = 1 + i * 5;
+        recordServerEdit(dv.getUint32(o, true), dv.getUint8(o + 4));
+      }
+    } else if (t === 4) { // DENY: 6 bytes (u8 type, u32 key, u8 block)
+      if (dv.byteLength >= 6) recordServerEdit(dv.getUint32(1, true), dv.getUint8(5));
+    } else if (t === 5 || t === 6) { // RELAY / RELAY_FULL
+      if (dv.byteLength < 5) return;
+      const np = dv.getUint16(1, true);
+      const ne = dv.getUint16(3, true);
+      let o = 5 + np * 19;
+      for (let i = 0; i < ne; i++, o += 7) {
+        if (o + 7 > dv.byteLength) break;
+        recordServerEdit(dv.getUint32(o + 2, true), dv.getUint8(o + 6));
+      }
+    }
+  }
+
+  function recordServerEdit(key, blockId) {
+    serverEdits.set(key, blockId);
+    if (sentEdits.has(key) && sentEdits.get(key) === blockId) acksSeen++;
+  }
+
+  function serverConfirmed(x, y, z, blockId) {
+    const k = editKey(x, y, z);
+    if (serverEdits.has(k)) return serverEdits.get(k) === blockId;
+    if (sentEdits.has(k)) return false; // we asked; not acknowledged (yet)
+    return getBlock(x, y, z) === blockId;
+  }
+
   const OrigWS = targetWindow.WebSocket || window.WebSocket;
 
   // The game socket lives at `/ws/<room>`. The voice socket lives at
@@ -102,6 +163,25 @@
             lastSinv = { s: Array.isArray(msg.s) ? msg.s : null, sel: msg.sel };
             console.log('[PIXEL-DEBUG] SINV slots =', msg.s ? msg.s.map(v => v && v[0]).join(',') : '(none)', '| sel =', msg.sel);
           }
+          // Server-authoritative placement/removal acks. These are the ground
+          // truth for whether a block we sent actually landed.
+          if (msg.t === 'placeack') {
+            if (Number.isInteger(msg.x) && Number.isInteger(msg.y) && Number.isInteger(msg.z) && Number.isInteger(msg.b)) {
+              const k = editKey(msg.x, msg.y, msg.z);
+              const wasSent = sentEdits.has(k);
+              serverEdits.set(k, msg.b);
+              if (wasSent) acksSeen++;
+              if (wasSent && sentEdits.get(k) !== msg.b) {
+                console.warn(`[PixelArt] ACK MISMATCH at (${msg.x},${msg.y},${msg.z}): asked ${sentEdits.get(k)}, server set ${msg.b}`);
+              }
+            }
+          }
+          if (msg.t === 'digack' && Number.isInteger(msg.x) && Number.isInteger(msg.y) && Number.isInteger(msg.z)) {
+            const k = editKey(msg.x, msg.y, msg.z);
+            const wasSent = sentEdits.has(k);
+            serverEdits.set(k, 0);
+            if (wasSent) acksSeen++;
+          }
           if (msg.t === 'old' || (msg.t === 'sys' && /out of date|reload|latest version|update available/i.test(msg.m || ''))) {
             // The game updated on the server but this tab is still running old
             // cached JS, so the server rejects every block edit. Only a reload
@@ -151,6 +231,7 @@
             }
           }
         } catch (e) { }
+        ingestServerEdits(event.data);
       }
     });
 
@@ -290,6 +371,7 @@
         ws.send(buildPosPacket(ix + 0.5, iy + 0.5, iz + 0.5));
         ws.send(JSON.stringify({ t: 'dig', s: 0, x: ix, y: iy, z: iz, f: 1, i: 1 }));
         ws.send(JSON.stringify({ t: 'dig', s: 2, x: ix, y: iy, z: iz, f: 1, i: 1 }));
+        sentEdits.set(editKey(ix, iy, iz), 0);
         packetsSentCount++;
         return true;
       }
@@ -330,6 +412,7 @@
       }
       ws.send(buildPosPacket(nx + 0.5, ny + 0.5, nz + 0.5));
       ws.send(JSON.stringify({ t: 'place', x: nx, y: ny, z: nz, f: face }));
+      sentEdits.set(editKey(ix, iy, iz), blockId);
       console.log('[PIXEL-DEBUG] US place block', blockId, 'slot', slot, 'target', ix, iy, iz, 'against', nx, ny, nz, 'face', face, found ? '(solid nbr)' : '(no nbr)');
       packetsSentCount++;
       return true;
@@ -832,7 +915,7 @@
       this.sweepMode = 'zigzag'; // 'ltr' (printer) or 'zigzag'
       this.movePlayer = true;
       this.standoff = 2.5;
-      this.delayMs = 50;
+      this.delayMs = 180;
       this.lineRetries = 30;
       this.progress = { row: 0, col: 0, placed: 0, total: 0, status: '' };
       this.onProgress = null;
@@ -1073,18 +1156,25 @@
           await this._sleep(this.delayMs);
         }
 
-        // 2. Line verification & retry BEFORE moving to next line
-        for (let retry = 1; retry <= this.lineRetries && !this._cancel; retry++) {
-          await this._sleep(120);
-
+        // 2. Line verification & retry BEFORE moving to next line.
+        //    The local world updates optimistically, so it can't reveal blocks
+        //    the server silently dropped. Verify against mirrored server acks
+        //    (placeack / relay). If the server never acks our edits at all,
+        //    fall back to a single forced re-send of the whole row.
+        await this._sleep(250);
+        const useServerTruth = acksSeen > 0;
+        const maxPasses = useServerTruth ? this.lineRetries : 1;
+        for (let retry = 1; retry <= maxPasses && !this._cancel; retry++) {
           const missingCols = [];
           for (let col = 0; col < this.w; col++) {
             const woolIdx = this.grid[imgRow][col];
             if (woolIdx < 0) continue;
             const blockId = this.blockIds[woolIdx];
             const bPos = this._blockCoords(col, rowFromBottom);
-            if (getBlock(bPos.x, bPos.y, bPos.z) !== blockId) {
-              missingCols.push(col);
+            if (useServerTruth) {
+              if (!serverConfirmed(bPos.x, bPos.y, bPos.z, blockId)) missingCols.push(col);
+            } else {
+              missingCols.push(col); // no server feedback: blindly re-send once
             }
           }
 
@@ -1092,7 +1182,9 @@
             break;
           }
 
-          this.progress.status = `Row ${currentLineNum}: fixing ${missingCols.length} missed blocks (pass ${retry})...`;
+          this.progress.status = useServerTruth
+            ? `Row ${currentLineNum}: fixing ${missingCols.length} unconfirmed blocks (pass ${retry})...`
+            : `Row ${currentLineNum}: re-sending row (${missingCols.length} blocks, no server acks yet)...`;
           this._notify();
 
           for (const col of missingCols) {
@@ -1111,8 +1203,11 @@
             placeBlock(bPos.x, bPos.y, bPos.z, blockId);
             await this._sleep(this.delayMs);
           }
+
+          if (!useServerTruth) await this._sleep(250);
         }
 
+        console.log(`[PIXEL-DEBUG] Row ${currentLineNum} done | serverTruth=${useServerTruth} | acksSeen=${acksSeen}`);
         await this._sleep(60);
       }
     }
