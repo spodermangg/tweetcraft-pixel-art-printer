@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TweetCraft Pixel Art Printer
 // @namespace    https://tweetcraft.jai.vin
-// @version      1.6.7
+// @version      1.7.0
 // @description  Upload an image → auto-convert to wool colors → print pixel art like a bot (moves left→right, places blocks, fixes missed blocks per line)
 // @author       @vibecodingonsol
 // @match        https://tweetcraft.jai.vin/r/*
@@ -37,7 +37,6 @@
    * JSON {"t":"placeack", x, y, z, b} message (see the game's PlacePrediction).
    * We mirror those acks here so verification/retry reflects the real world.
    */
-  const KEY_MASK = 0x3FF; // 10 bits per horizontal axis (1024 world)
   const serverEdits = new Map(); // editKey -> blockId the server actually has
   const sentEdits = new Map();   // editKey -> blockId we last asked the server to set
   let acksSeen = 0;              // # of our own edits the server has acknowledged
@@ -170,7 +169,10 @@
               const k = editKey(msg.x, msg.y, msg.z);
               const wasSent = sentEdits.has(k);
               serverEdits.set(k, msg.b);
-              if (wasSent) acksSeen++;
+              if (wasSent) {
+                if (acksSeen === 0) console.log('[PixelArt] ✅ Server ACK working — placeack matches our edit. Retries verify against server truth.');
+                acksSeen++;
+              }
               if (wasSent && sentEdits.get(k) !== msg.b) {
                 console.warn(`[PixelArt] ACK MISMATCH at (${msg.x},${msg.y},${msg.z}): asked ${sentEdits.get(k)}, server set ${msg.b}`);
               }
@@ -181,6 +183,31 @@
             const wasSent = sentEdits.has(k);
             serverEdits.set(k, 0);
             if (wasSent) acksSeen++;
+          }
+          // The game opens a container window (Furnace/Chest/Crafting Table) when
+          // the printer's crosshair lands on one and a use/right-click fires.
+          // While a window is open the server ignores block edits, so we must
+          // close it immediately for printing to continue.
+          if ((msg.t === 'wopened' || msg.t === 'win') && msg.w > 0) {
+            const isContainer = !msg.k || /furnace|chest|generic|craft|table|enchant|dispenser|hopper|brewing|anvil|smoker|blast|barrel|shulker|grindstone|stonecutter|loom|cartography/i.test(String(msg.k));
+            console.log('[PIXEL-DEBUG] Container window opened:', msg.t, 'id=', msg.w, 'kind=', msg.k || '');
+            if (isContainer && activePrinter && activePrinter.running && capturedWS && capturedWS.readyState === 1) {
+              try {
+                const closeMsg = { t: 'wclose', w: msg.w };
+                if (msg.q != null) closeMsg.q = msg.q;
+                targetWindow.__pixelArtSending = true;
+                capturedWS.send(JSON.stringify(closeMsg));
+                targetWindow.__pixelArtSending = false;
+                console.log('[PIXEL-DEBUG] Auto-closed container window', msg.w, '— edits should resume.');
+              } catch (e) { targetWindow.__pixelArtSending = false; }
+              // Also let the game close its own UI so it doesn't stay stuck.
+              try {
+                const ev = new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true });
+                (document.activeElement || document).dispatchEvent(ev);
+                window.dispatchEvent(ev);
+                document.dispatchEvent(ev);
+              } catch (e) { }
+            }
           }
           if (msg.t === 'old' || (msg.t === 'sys' && /out of date|reload|latest version|update available/i.test(msg.m || ''))) {
             // The game updated on the server but this tab is still running old
@@ -403,7 +430,8 @@
       if (slot === -1) {
         slot = 0;
         ws.send(JSON.stringify({ t: 'inv', hotbar: [blockId, blockId, blockId, blockId, blockId, blockId, blockId, blockId, blockId], slot: 0 }));
-        lastSelSlot = null;
+        // `inv` already carries the selected slot, so no separate `sel` is needed.
+        lastSelSlot = slot;
         lastSinv = null;
       }
       if (lastSelSlot !== slot) {
@@ -598,6 +626,12 @@
   const TEXCOLOR_KEY = 'tcpixelart.texcolor.v1';
   // Blocks that must never be printed (unbreakable / not legitimately placeable).
   const EXCLUDED_BLOCKS = new Set(['bedrock']);
+  // Container/interactive blocks open a window when the printer's crosshair lands
+  // on them (the game's Screens.use fires on right-click). An open window makes
+  // the server ignore block edits, so we never print these — map them to Black
+  // Wool instead. Add more names here if they cause the same problem.
+  const BLACK_WOOL_ID = 62;
+  const WINDOW_BLOCK_RE = /furnace|crafting table|chest/i;
   let fullPalette = null;
   let fullPalettePromise = null;
 
@@ -681,9 +715,15 @@
   const BLOCK_SUBSTITUTES = { 12: 34 }; // Bedrock → Block of Coal
   function sanitizePalette(pal) {
     if (!pal || !pal.ids) return pal;
+    const data = getBlockData();
+    const names = data ? data.blockNames : null;
     let changed = false;
     const ids = pal.ids.map((id) => {
       if (BLOCK_SUBSTITUTES[id] != null) { changed = true; return BLOCK_SUBSTITUTES[id]; }
+      if (names) {
+        const nm = String(names[id] || '').toLowerCase();
+        if (nm && WINDOW_BLOCK_RE.test(nm)) { changed = true; return BLACK_WOOL_ID; }
+      }
       return id;
     });
     return changed ? { rgb: pal.rgb, ids, all: pal.all } : pal;
@@ -764,7 +804,12 @@
       }));
 
       for (const e of entries) {
-        if (e.col) { rgb.push(e.col); ids.push(e.id); }
+        if (e.col) {
+          rgb.push(e.col);
+          // Container blocks (furnace/chest/table) can't be printed safely —
+          // place Black Wool there instead, so their color still maps to black.
+          ids.push(WINDOW_BLOCK_RE.test(e.name.toLowerCase()) ? BLACK_WOOL_ID : e.id);
+        }
       }
 
       try { localStorage.setItem(TEXCOLOR_KEY, JSON.stringify(cache)); } catch (e) { /* ignore */ }
@@ -1061,15 +1106,20 @@
         }
 
         // 2. Line verification & retry BEFORE moving to next line.
-        //    The server rate-limits edits and rejects some with a DENY (which
-        //    the game reverts locally), so re-scan this row and re-clear what's left.
-        for (let retry = 1; retry <= this.lineRetries && !this._cancel; retry++) {
-          await this._sleep(120);
-
+        //    Verify against mirrored server acks; the local world is optimistic
+        //    and cannot reveal silently dropped digs.
+        await this._sleep(250);
+        const clearUseServerTruth = acksSeen > 0;
+        const clearMaxPasses = clearUseServerTruth ? this.lineRetries : 1;
+        for (let retry = 1; retry <= clearMaxPasses && !this._cancel; retry++) {
           const missingCols = [];
           for (let c = 0; c < w; c++) {
             const bPos = this._blockCoords(c, r);
-            if (getBlock(bPos.x, bPos.y, bPos.z) !== 0) missingCols.push(c);
+            if (clearUseServerTruth) {
+              if (!serverConfirmed(bPos.x, bPos.y, bPos.z, 0)) missingCols.push(c);
+            } else {
+              missingCols.push(c);
+            }
           }
 
           if (missingCols.length === 0) break;
@@ -1091,6 +1141,8 @@
             placeBlock(bPos.x, bPos.y, bPos.z, 0);
             await this._sleep(delayMs);
           }
+
+          if (!clearUseServerTruth) await this._sleep(250);
         }
 
         await this._sleep(60);
@@ -1163,6 +1215,9 @@
         //    fall back to a single forced re-send of the whole row.
         await this._sleep(250);
         const useServerTruth = acksSeen > 0;
+        if (!useServerTruth && currentLineNum === 1) {
+          console.warn('[PixelArt] ⚠️ No server acks seen — falling back to blindly re-sending each row. (Server may not acknowledge raw place packets.)');
+        }
         const maxPasses = useServerTruth ? this.lineRetries : 1;
         for (let retry = 1; retry <= maxPasses && !this._cancel; retry++) {
           const missingCols = [];
@@ -1655,7 +1710,7 @@
 
       <div id="pa-header">
         <div class="title-wrap">
-          <div class="title"><span>🖨️</span> Pixel Art Printer <span style="font-size:10px; color:#c084fc; background:rgba(147,51,234,0.3); padding:2px 6px; border-radius:10px;">v1.6.7</span></div>
+          <div class="title"><span>🖨️</span> Pixel Art Printer <span style="font-size:10px; color:#c084fc; background:rgba(147,51,234,0.3); padding:2px 6px; border-radius:10px;">v1.7.0</span></div>
           <div class="byline">by @vibecodingonsol</div>
         </div>
         <button id="pa-toggle-btn">▾</button>
