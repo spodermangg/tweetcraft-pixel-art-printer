@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         TweetCraft 3D Model Printer
 // @namespace    https://tweetcraft.jai.vin
-// @version      1.4.3
+// @version      1.5.1
 // @description  Upload a 3D model (OBJ/MTL, STL, GLB or FBX) → voxelize it → print it into your TweetCraft world as real blocks. Respects the 128-block max build height.
-// @author       @vibecodingonsol
+// @author       @vibecodingonsol and @andrestube123
 // @match        https://tweetcraft.jai.vin/r/*
 // @match        https://tweetcraft.jai.vin/play/*
 // @grant        unsafeWindow
@@ -308,6 +308,94 @@
    * ───────────────────────────────────────────── */
   const WORLD_MAX_Y = 128; // Y range is 1..127 (128 is the max build height)
 
+  // ── Build protocol (ported from the known-good TweetCraft WorldEdit) ──
+  // Every accepted edit happens within ~6 blocks of the player, so before each
+  // op we park a spoofed position right next to the block (flying flag = 2, so
+  // gravity never drags the spoofer down mid-build). A place names the exact
+  // destination in `p`; the position/face (`x,y,z,f`) only says which solid
+  // neighbour it is attached to. The real hotbar + position are restored once a
+  // job finishes.
+  const FACE_N = [[0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]];
+  const SUPPORT_ORDER = [1, 4, 5, 2, 3, 0]; // below, sides, above
+  let opSeq = 0;
+  const heldOp = { held: -1, realBar: null, realSlot: 0 };
+
+  function readHotbar() {
+    const mc = targetWindow.__mc || window.__mc;
+    if (mc && mc.S && Array.isArray(mc.S.hotbar) && mc.S.hotbar.length === 9) return mc.S.hotbar.slice();
+    try {
+      const h = JSON.parse(localStorage.getItem('mc.hotbar'));
+      if (Array.isArray(h) && h.length === 9) return h;
+    } catch (e) { /* ignore */ }
+    if (lastSinv && Array.isArray(lastSinv.s) && lastSinv.s.length === 9) {
+      return lastSinv.s.map((e) => (e && Number.isInteger(e[0]) ? e[0] : 0));
+    }
+    return new Array(9).fill(0);
+  }
+  function readSlot() {
+    const mc = targetWindow.__mc || window.__mc;
+    if (mc && mc.S && Number.isInteger(mc.S.slot)) return mc.S.slot;
+    if (lastSinv && Number.isInteger(lastSinv.sel)) return lastSinv.sel;
+    return 0;
+  }
+  // Put `id` in slot 0 while preserving the rest of the real hotbar, so we can
+  // put the player's inventory back afterwards (the old code wiped all 9 slots).
+  function setHeldBlock(id) {
+    const ws = capturedWS;
+    if (!ws || ws.readyState !== 1) return;
+    if (heldOp.held === id) return;
+    if (heldOp.held === -1) {
+      heldOp.realBar = readHotbar();
+      heldOp.realSlot = readSlot();
+    }
+    heldOp.held = id;
+    const hb = heldOp.realBar.slice();
+    hb[0] = id;
+    ws.send(JSON.stringify({ t: 'inv', hotbar: hb, slot: 0 }));
+    lastSinv = null;
+    lastSelSlot = 0;
+  }
+  function restoreHeld() {
+    if (heldOp.held === -1) return;
+    heldOp.held = -1;
+    const hb = heldOp.realBar;
+    heldOp.realBar = null;
+    const ws = capturedWS;
+    if (!hb || !ws || ws.readyState !== 1) return;
+    try { ws.send(JSON.stringify({ t: 'inv', hotbar: hb, slot: heldOp.realSlot || 0 })); } catch (e) { /* ignore */ }
+  }
+  // 18-byte POS frame (type 1) parking the player at (x,y,z) with the flying
+  // flag set, exactly like the game streams when in flight.
+  function buildSpoofPos(x, y, z) {
+    const buf = new ArrayBuffer(18);
+    const dv = new DataView(buf);
+    dv.setUint8(0, 1);
+    dv.setFloat32(1, x, true);
+    dv.setFloat32(5, y, true);
+    dv.setFloat32(9, z, true);
+    dv.setInt16(13, 0, true);
+    dv.setInt16(15, 0, true);
+    dv.setUint8(17, 2);
+    return buf;
+  }
+  function sendRealPos() {
+    const ws = capturedWS;
+    const st = getPlayerState();
+    if (!ws || ws.readyState !== 1 || !st) return;
+    const buf = new ArrayBuffer(18);
+    const dv = new DataView(buf);
+    dv.setUint8(0, 1);
+    dv.setFloat32(1, st[0], true);
+    dv.setFloat32(5, st[1], true);
+    dv.setFloat32(9, st[2], true);
+    dv.setInt16(13, 0, true);
+    dv.setInt16(15, 0, true);
+    dv.setUint8(17, 0);
+    targetWindow.__model3dSending = true;
+    try { ws.send(buf); } catch (e) { /* ignore */ }
+    targetWindow.__model3dSending = false;
+  }
+
   function sendEditPacket(x, y, z, blockId) {
     const ws = capturedWS;
     if (!ws) {
@@ -332,25 +420,13 @@
       return false;
     }
 
-    // Survival-style build rooms place a block via:
-    //   1) {"t":"inv","hotbar":[9 block ids],"slot":n}    -> server learns what we hold
-    //   2) {"t":"sel","i":n}                              -> select the holding slot
-    //   3) {"t":"place","x","y","z","f"}                  -> place held block against face f
-    // window.__mc only exists in DEV, so replicate the exact wire messages here.
-    const FACES = [[0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]];
-
     targetWindow.__model3dSending = true;
     try {
       if (blockId === 0) {
-        // Clearing: the server removes blocks through the dig flow. The game uses
-        // a UNIQUE incrementing sequence `i` per dig (++digSeq) to correlate the
-        // start/done stages; reusing one value makes the server ignore later digs
-        // as stale, which is why some support blocks survived cleanup.
-        const seq = ++digSeqCounter;
-        ws.send(JSON.stringify({ t: 'inv', hotbar: [0, 0, 0, 0, 0, 0, 0, 0, 0], slot: 0 }));
-        ws.send(buildPosPacket(ix + 0.5, iy + 0.5, iz + 0.5));
-        ws.send(JSON.stringify({ t: 'dig', s: 0, x: ix, y: iy, z: iz, f: 1, i: seq }));
-        ws.send(JSON.stringify({ t: 'dig', s: 2, x: ix, y: iy, z: iz, f: 1, i: seq }));
+        // Clearing: a single one-stage dig with the player parked above the block.
+        opSeq++;
+        ws.send(buildSpoofPos(ix + 0.5, Math.min(WORLD_MAX_Y - 1, iy + 3), iz + 0.5));
+        ws.send(JSON.stringify({ t: 'dig', s: 0, x: ix, y: iy, z: iz, f: 1, i: opSeq }));
         packetsSentCount++;
         sentEdits.set(editKey(ix, iy, iz), 0);
         return true;
@@ -358,37 +434,19 @@
 
       // Pick a solid neighbour so we have a valid face to place against.
       let nx = ix, ny = iy, nz = iz, face = 1, found = false;
-      for (let fi = 0; fi < 6; fi++) {
-        const d = FACES[fi];
+      for (const f of SUPPORT_ORDER) {
+        const d = FACE_N[f];
         const cx = ix - d[0], cy = iy - d[1], cz = iz - d[2];
         if (cy < 0 || cy >= WORLD_MAX_Y) continue;
         const b = getBlock(cx, cy, cz);
-        if (b > 0 && b !== 255) { nx = cx; ny = cy; nz = cz; face = fi; found = true; break; }
+        if (b > 0 && b !== 255) { nx = cx; ny = cy; nz = cz; face = f; found = true; break; }
       }
-      if (!found) { nx = ix; ny = iy; nz = iz; face = 1; }
 
-      // Choose a slot that already holds this block; otherwise fabricate a hotbar.
-      let slot = -1;
-      if (lastSinv && Array.isArray(lastSinv.s)) {
-        for (let i = 0; i < 9; i++) {
-          const entry = lastSinv.s[i];
-          if (entry && entry[0] === blockId) { slot = i; break; }
-        }
-      }
-      if (slot === -1) {
-        slot = 0;
-        ws.send(JSON.stringify({ t: 'inv', hotbar: [blockId, blockId, blockId, blockId, blockId, blockId, blockId, blockId, blockId], slot: 0 }));
-        // `inv` already carries the selected slot, so no separate `sel` is needed.
-        lastSelSlot = slot;
-        lastSinv = null;
-      }
-      if (lastSelSlot !== slot) {
-        ws.send(JSON.stringify({ t: 'sel', i: slot }));
-        lastSelSlot = slot;
-      }
-      ws.send(buildPosPacket(nx + 0.5, ny + 0.5, nz + 0.5));
-      ws.send(JSON.stringify({ t: 'place', x: nx, y: ny, z: nz, f: face }));
-      console.log('[MODEL3D-DEBUG] US place block', blockId, 'slot', slot, 'target', ix, iy, iz, 'against', nx, ny, nz, 'face', face, found ? '(solid nbr)' : '(no nbr)');
+      opSeq++;
+      setHeldBlock(blockId);
+      ws.send(buildSpoofPos(nx + 0.5, Math.min(WORLD_MAX_Y - 1, ny + 3), nz + 0.5));
+      ws.send(JSON.stringify({ t: 'place', x: nx, y: ny, z: nz, f: face, i: opSeq, p: [ix, iy, iz] }));
+      console.log('[MODEL3D-DEBUG] US place block', blockId, 'target', ix, iy, iz, 'against', nx, ny, nz, 'face', face, found ? '(solid nbr)' : '(no nbr)');
       packetsSentCount++;
       sentEdits.set(editKey(ix, iy, iz), blockId);
       return true;
@@ -401,19 +459,17 @@
   }
 
   // Mine out the block currently at (x,y,z) so a different block can be placed
-  // there. Sends the game's dig flow (start + done) and waits briefly for the
-  // server to process it before the caller places the new block.
+  // there. Sends a single one-stage dig (like the game's creative break) with
+  // the player parked above the block.
   async function clearCell(x, y, z) {
     if (!capturedWS || capturedWS.readyState !== 1) return;
     const mc = targetWindow.__mc || window.__mc;
-    const seq = ++digSeqCounter;
+    opSeq++;
     console.log(`[Model3D] Pre-clearing existing block at (${x}, ${y}, ${z})`);
     targetWindow.__model3dSending = true;
     try {
-      capturedWS.send(JSON.stringify({ t: 'inv', hotbar: [0, 0, 0, 0, 0, 0, 0, 0, 0], slot: 0 }));
-      capturedWS.send(buildPosPacket(x + 0.5, y + 0.5, z + 0.5));
-      capturedWS.send(JSON.stringify({ t: 'dig', s: 0, x, y, z, f: 1, i: seq }));
-      capturedWS.send(JSON.stringify({ t: 'dig', s: 2, x, y, z, f: 1, i: seq }));
+      capturedWS.send(buildSpoofPos(x + 0.5, Math.min(WORLD_MAX_Y - 1, y + 3), z + 0.5));
+      capturedWS.send(JSON.stringify({ t: 'dig', s: 0, x, y, z, f: 1, i: opSeq }));
     } catch (e) {
       console.warn('[Model3D] Pre-clear dig failed:', e);
     }
@@ -421,7 +477,7 @@
     sentEdits.set(editKey(x, y, z), 0);
     if (mc && mc.eng && mc.eng.x) mc.eng.x.set_block(x, y, z, 0);
     else if (wasmExports && typeof wasmExports.set_block === 'function') wasmExports.set_block(x, y, z, 0);
-    await new Promise((r) => setTimeout(r, 120));
+    await new Promise((r) => setTimeout(r, 60));
   }
 
   async function placeBlock(x, y, z, blockId) {
@@ -1181,12 +1237,13 @@
       this.running = false;
       this.paused = false;
       this.delayMs = 45;
-      this.retries = 12;
+      this.retries = 1;
       this.movePlayer = true;
       this.standoff = 3;
       this.progress = { placed: 0, total: 0, layer: 0, layers: 0, status: '' };
       this.onProgress = null;
       this._cancel = false;
+      this._topDown = false;
     }
 
     _hasVoxel(x, y, z) {
@@ -1197,6 +1254,15 @@
     // the voxel below, or an adjacent neighbour placed earlier in the per-layer
     // sweep (z-then-x order → x-1 and z-1). Everything else chains onto the model.
     _needsSupport(it) {
+      if (this._topDown) {
+        // Top-down: the block above was placed in the previous (higher) layer, or
+        // an earlier same-layer neighbour (x-1 / z-1) is already down, so we have
+        // something to hang the new block off — no pillar required.
+        if (this._hasVoxel(it.x, it.y + 1, it.z)) return false; // above
+        if (this._hasVoxel(it.x - 1, it.y, it.z)) return false; // earlier on x
+        if (this._hasVoxel(it.x, it.y, it.z - 1)) return false; // earlier on z
+        return true;
+      }
       if (this._hasVoxel(it.x, it.y - 1, it.z)) return false; // below
       if (this._hasVoxel(it.x - 1, it.y, it.z)) return false; // earlier on x
       if (this._hasVoxel(it.x, it.y, it.z - 1)) return false; // earlier on z
@@ -1225,7 +1291,14 @@
         if (this._cancel) return;
         if (this.movePlayer) movePlayer_(wx + 0.5, y + this.standoff, wz + 0.5);
         if (!(await placeBlock(wx, y, wz, blockId))) return;
-        this._scaffoldPlaced.push({ x: wx, y, z: wz });
+        // A pillar cell that coincides with a model voxel is only a temporary
+        // placeholder: the model block will be placed there later (replacing this
+        // scaffold), so don't queue it for removal or we would dig the finished
+        // model. This only happens in top-down mode, where lower model layers
+        // haven't been placed yet while a support pillar is being raised.
+        if (!this._hasVoxel(it.x, y - origin.y, it.z)) {
+          this._scaffoldPlaced.push({ x: wx, y, z: wz });
+        }
         this._hadScaffold = true;
         await this._sleep(this.delayMs);
       }
@@ -1239,17 +1312,15 @@
       this.progress.status = `Removing ${pads.length} support block(s)…`;
       this._notify();
       const ordered = [...pads].sort((a, b) => b.y - a.y); // top-down
-      // Digs are rate-limited (~200ms) more aggressively than placements, and we
-      // get no acks, so use a slower cadence and run two passes to catch drops.
-      const digDelay = Math.max(this.delayMs, 200);
-      for (let pass = 0; pass < 2 && !this._cancel; pass++) {
-        for (const p of ordered) {
-          await this._waitUnpaused();
-          if (this._cancel) return;
-          if (this.movePlayer) movePlayer_(p.x + 0.5, p.y + this.standoff, p.z + 0.5);
-          await placeBlock(p.x, p.y, p.z, 0);
-          await this._sleep(digDelay);
-        }
+      // Same cadence as a normal clean-up: a single pass is enough, blocks that
+      // are already air are skipped.
+      for (const p of ordered) {
+        await this._waitUnpaused();
+        if (this._cancel) return;
+        if (getBlock(p.x, p.y, p.z) === 0) continue;
+        if (this.movePlayer) movePlayer_(p.x + 0.5, p.y + this.standoff, p.z + 0.5);
+        await placeBlock(p.x, p.y, p.z, 0);
+        await this._sleep(this.delayMs);
       }
       this._scaffoldPlaced = [];
     }
@@ -1273,26 +1344,28 @@
     }
 
     // items: array of { x, y, z, blockId } in local grid coords (y = layer, 0-based)
-    async build(items, origin, delayMs, retries, movePlayer, scaffold) {
+    async build(items, origin, delayMs, retries, movePlayer, scaffold, topDown) {
       this.delayMs = delayMs;
       this.retries = retries;
       this.movePlayer = movePlayer;
       this.scaffold = !!scaffold;
+      this._topDown = !!topDown;
       this._scaffoldPlaced = [];
       this._hadScaffold = false;
       this.running = true;
       this.paused = false;
       this._cancel = false;
 
-      // Group by layer (y) ascending; within a layer sort by z then x.
+      // Group by layer (y). Bottom-up builds lowest layer first; top-down builds
+      // the highest layer first so each block can hang off the one above it.
       const byLayer = new Map();
       for (const it of items) {
         if (!byLayer.has(it.y)) byLayer.set(it.y, []);
         byLayer.get(it.y).push(it);
       }
-      const layers = [...byLayer.keys()].sort((a, b) => a - b);
+      const layers = [...byLayer.keys()].sort((a, b) => (this._topDown ? b - a : a - b));
 
-      this.progress = { placed: 0, total: items.length, layer: 0, layers: layers.length, status: 'Starting build…' };
+      this.progress = { placed: 0, total: items.length, layer: 0, layers: layers.length, status: this._topDown ? 'Starting top→bottom build…' : 'Starting build…' };
       this._notify();
 
       this._voxelKeys = new Set(items.map((it) => `${it.x},${it.y},${it.z}`));
@@ -1371,6 +1444,8 @@
 
       if (this.scaffold && !this._cancel) await this._removeScaffold();
 
+      restoreHeld();
+      sendRealPos();
       this.running = false;
       let stillMissing = 0;
       if (!this._cancel && acksSeen > 0) {
@@ -1414,6 +1489,8 @@
       this.running = false;
       this.progress.status = this._cancel ? '⛔ Stopped' : '✅ Cleared!';
       this._notify();
+      restoreHeld();
+      sendRealPos();
     }
   }
   // local alias so class methods can call the module-level movePlayer
@@ -1631,8 +1708,8 @@
 
       <div id="m3d-header">
         <div>
-          <div class="title"><span>🧊</span> 3D Model Printer <span style="font-size:10px; color:#5eead4; background:rgba(20,184,166,0.25); padding:2px 6px; border-radius:10px;">v1.4.1</span></div>
-          <div class="byline">by @vibecodingonsol</div>
+          <div class="title"><span>🧊</span> 3D Model Printer <span style="font-size:10px; color:#5eead4; background:rgba(20,184,166,0.25); padding:2px 6px; border-radius:10px;">v1.5.1</span></div>
+          <div class="byline">by @vibecodingonsol and @andrestube123</div>
         </div>
         <button id="m3d-toggle-btn">▾</button>
       </div>
@@ -1700,7 +1777,7 @@
           <div style="font-size:10px; color:#fbbf24; line-height:1.35; margin:-4px 0 8px; padding-left:92px;">⚠️ Default is 45 ms. Very low values may cause the server to silently drop blocks (results vary with server load).</div>
           <div class="m3d-row">
             <label>Layer Retries</label>
-            <input type="number" id="m3d-retries" value="12" min="1" max="60" step="1">
+            <input type="number" id="m3d-retries" value="1" min="1" max="60" step="1">
           </div>
           <div class="m3d-row">
             <label>Move Player</label>
@@ -1711,6 +1788,13 @@
             <label>Support Pillars</label>
             <input type="checkbox" id="m3d-scaffold" checked title="The game only lets you place a block against an existing solid block. For models suspended in mid-air, add the fewest temporary support blocks needed (a single pillar under the first block of a run — the rest chain onto the model), then remove them after building. No effect when the model already rests on the ground.">
             <span class="hint" id="m3d-scaffold-info">Sky builds: minimal support + clean up</span>
+          </div>
+          <div class="m3d-row">
+            <label>Print Order</label>
+            <select id="m3d-order" title="Bottom → Top is the classic layer-by-layer build. Top → Bottom prints the highest layer first and lets every lower block hang off the one above, so a run interrupted by a disconnect can be finished by rebuilding the remaining layers from the top down.">
+              <option value="bottom-up">Bottom → Top (default)</option>
+              <option value="top-down">Top → Bottom (hang from above)</option>
+            </select>
           </div>
         </div>
 
@@ -2018,7 +2102,7 @@
         const info = document.createElement('div'); info.className = 'm3d-art-info';
         const name = document.createElement('div'); name.className = 'm3d-art-name'; name.textContent = m.name || 'Untitled'; name.title = 'Click to rename';
         const meta = document.createElement('div'); meta.className = 'm3d-art-meta';
-        meta.textContent = `${m.dx}×${m.dy}×${m.dz} · (${m.origin.x}, ${m.origin.y}, ${m.origin.z})`;
+        meta.textContent = `${m.dx}×${m.dy}×${m.dz} · (${m.origin.x}, ${m.origin.y}, ${m.origin.z})` + (m.order === 'top-down' ? ' · top→bottom' : '');
         info.appendChild(name); info.appendChild(meta);
         const btns = document.createElement('div'); btns.className = 'm3d-art-btns';
         const bRedo = document.createElement('button'); bRedo.className = 'm3d-art-btn redo'; bRedo.textContent = '🔁'; bRedo.title = 'Rebuild this model';
@@ -2038,6 +2122,7 @@
       const rec = {
         dx: meta.dx, dy: meta.dy, dz: meta.dz,
         origin: meta.origin, delay: meta.delay, retries: meta.retries, move: meta.move,
+        scaffold: meta.scaffold, order: meta.order,
         size: meta.size, up: meta.up, solid: meta.solid, colorMode: meta.colorMode, single: meta.single,
         preview: meta.preview || '', blocks: encodeBlocks(items),
       };
@@ -2063,6 +2148,7 @@
       if (m.retries) panel.querySelector('#m3d-retries').value = m.retries;
       panel.querySelector('#m3d-move').checked = m.move !== false;
       panel.querySelector('#m3d-scaffold').checked = m.scaffold !== false;
+      panel.querySelector('#m3d-order').value = m.order === 'top-down' ? 'top-down' : 'bottom-up';
       if (m.size) sizeInput.value = m.size;
       if (m.up) upSel.value = m.up;
       solidCheck.checked = !!m.solid;
@@ -2111,9 +2197,11 @@
 
       const mode = colorModeSel.value;
       const delay = parseInt(panel.querySelector('#m3d-delay').value) || 45;
-      const retries = parseInt(panel.querySelector('#m3d-retries').value) || 12;
+      const retries = parseInt(panel.querySelector('#m3d-retries').value) || 1;
       const move = panel.querySelector('#m3d-move').checked;
       const scaffold = panel.querySelector('#m3d-scaffold').checked;
+      const order = panel.querySelector('#m3d-order').value;
+      const topDown = order === 'top-down';
       const origin = getOrigin();
 
       // Validate height / world bounds
@@ -2170,7 +2258,7 @@
       pauseBtn.style.display = '';
       stopBtn.style.display = '';
 
-      await printer.build(items, origin, delay, retries, move, scaffold);
+      await printer.build(items, origin, delay, retries, move, scaffold, topDown);
 
       startBtn.style.display = '';
       pauseBtn.style.display = 'none';
@@ -2184,7 +2272,7 @@
           dy: currentVoxels ? currentVoxels.dy : 0,
           dz: currentVoxels ? currentVoxels.dz : 0,
           origin, delay, retries, move,
-          scaffold,
+          scaffold, order,
           size: parseInt(sizeInput.value) || 48,
           up: upSel.value,
           solid: solidCheck.checked,
