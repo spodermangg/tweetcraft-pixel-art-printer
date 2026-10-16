@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TweetCraft Anti-Grief
 // @namespace    https://tweetcraft.jai.vin
-// @version      1.4.0
+// @version      1.4.2
 // @description  Protect a region: press 1-4 at four corners to define a cube, scan it into a snapshot, and later revert any grief (destroyed / changed / added blocks, fire, water and lava) back to the snapshot state.
 // @match        https://tweetcraft.jai.vin/r/*
 // @match        https://tweetcraft.jai.vin/play/*
@@ -28,6 +28,7 @@
   //  this session only.
   // ────────────────────────────────────────────────────────────────────
   const SNAP_KEY = 'tc.antigrief.v1';
+  const SNAP_EXT_KEY = 'tc.antigrief.ext.v1';
   let store = loadStore();
 
   function loadStore() {
@@ -36,7 +37,18 @@
       if (s && Array.isArray(s.snaps)) return s;
     } catch (e) { /* ignore */ }
     return { snaps: [] };
+  }  function loadExtern() {
+    try {
+      const raw = localStorage.getItem(SNAP_EXT_KEY);
+      if (!raw) return { ids: [], stubs: [] };
+      const p = JSON.parse(raw);
+      return { ids: Array.isArray(p.ids)?p.ids:[], stubs: Array.isArray(p.stubs)?p.stubs:[] };
+    } catch (e) { return { ids: [], stubs: [] }; }
   }
+  function saveExtern(ids, stubs) {
+    try { localStorage.setItem(SNAP_EXT_KEY, JSON.stringify({ ids, stubs })); return true; } catch (e) { return false; }
+  }
+
   // Only the persisted fields are written; the big in-memory `_pad` cache
   // must never reach localStorage.
   function serializable() {
@@ -53,6 +65,12 @@
     catch (e) { return false; }
   }
   const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  function nextName(base) {
+    const names = store.snaps.map(x=>x.name);
+    let n = base; let i = 1;
+    while (names.includes(n)) n = base + " v" + (i++);
+    return n;
+  }
 
   function bytesToB64(bytes) {
     let s = '';
@@ -672,11 +690,19 @@
       };
       snap._pad = res.pad;
       store.snaps.unshift(snap);
-      const saved = saveStore();
-      if (!saved) keepInMemoryOnly(snap);
+      let saved = saveStore();
+      if (!saved) {
+        externOnly.add(snap.id);
+        saveStore();
+        try {
+          const stubs = store.snaps.filter(x=>externOnly.has(x.id)).map(x=>({id:x.id,name:x.name,ts:x.ts,ox:x.ox,oy:x.oy,oz:x.oz,sx:x.sx,sy:x.sy,sz:x.sz,count:x.count}));
+          saveExtern(Array.from(externOnly), stubs);
+          exportSnapshot(snap);
+        } catch (e) {}
+      }
       el('ag-name').value = '';
       setProgress(0);
-      setStatus('Saved "' + name + '" (' + fmt(snap.count) + ' blocks)' + (saved ? '' : ' — too big for localStorage, kept in memory'), saved ? 'ok' : 'warn');
+      setStatus('Saved "' + name + '" (' + fmt(snap.count) + ' blocks)' + (saved ? '' : ' — too big for localStorage; exported as JSON (needed to restore)'), saved ? 'ok' : 'warn');
       toast('Snapshot "' + name + '" saved', 2200);
     } catch (e) {
       setProgress(0);
@@ -689,6 +715,13 @@
 
   const memoryOnly = new Set();
   const externOnly = new Set();
+  const _ext = loadExtern();
+  for (const id of _ext.ids) externOnly.add(id);
+  if (_ext.stubs.length) {
+    const m = new Set(store.snaps.map(x=>x.id));
+    for (const st of _ext.stubs) { if (!m.has(st.id)) { store.snaps.push(st); m.add(st.id); }
+    }
+  }
   function keepInMemoryOnly(snap) {
     memoryOnly.add(snap.id);
     // roll back the persisted copy so localStorage never holds the oversized blob
@@ -711,9 +744,18 @@
       snap.ts = Date.now();
       snap.enc = encodePad(res.pad, res.sy, res.sz);
       snap._pad = res.pad;
-      const saved = saveStore();
+      let saved = saveStore();
+      if (!saved) {
+        externOnly.add(snap.id);
+        saveStore();
+        try {
+          const stubs = store.snaps.filter(x=>externOnly.has(x.id)).map(x=>({id:x.id,name:x.name,ts:x.ts,ox:x.ox,oy:x.oy,oz:x.oz,sx:x.sx,sy:x.sy,sz:x.sz,count:x.count}));
+          saveExtern(Array.from(externOnly), stubs);
+          exportSnapshot(snap);
+        } catch (e) {}
+      }
       setProgress(0);
-      setStatus('Updated "' + snap.name + '" (' + fmt(snap.count) + ' blocks)' + (saved ? '' : ' — kept in memory'), saved ? 'ok' : 'warn');
+      setStatus('Updated "' + snap.name + '" (' + fmt(snap.count) + ' blocks)' + (saved ? '' : ' — too big; exported JSON (needed to restore)'), saved ? 'ok' : 'warn');
     } catch (e) {
       setProgress(0);
       setStatus('Update ' + (e && e.message === 'cancelled' ? 'cancelled' : 'failed'), 'warn');
@@ -935,30 +977,50 @@
       row.className = 'ag-srow';
       const when = new Date(s.ts).toLocaleString();
       const mem = memoryOnly.has(s.id) ? ' · memory only' : '';
+      const ext = externOnly.has(s.id) ? ' · ⚠ external JSON only (backup required to restore)' : '';
       row.innerHTML =
         '<div class="ag-sinfo">' +
         '<div class="ag-sname" title="' + esc(s.name) + '">' + esc(s.name) + '</div>' +
-        '<div class="ag-smeta">' + s.sx + '×' + s.sy + '×' + s.sz + ' · ' + fmt(s.count) + ' blocks · ' + when + mem + '</div>' +
+        '<div class="ag-smeta">' + s.sx + '×' + s.sy + '×' + s.sz + ' · ' + fmt(s.count) + ' blocks · ' + when + mem + ext + '</div>' +
         '</div>' +
         '<div class="ag-sbtns">' +
         '<button class="ag-act ag-rev" title="Revert the region to this snapshot">↩ Revert</button>' +
         '<button class="ag-act ag-upd" title="Re-scan the same region and overwrite this snapshot">↻</button>' +
         '<button class="ag-act ag-ren" title="Rename">✎</button>' +
+        '<button class="ag-act ag-exp" title="Export as JSON backup">💾 Export</button>' +
         '<button class="ag-act ag-del" title="Delete">✕</button>' +
         '</div>';
-      row.querySelector('.ag-rev').addEventListener('click', () => revert(s));
-      row.querySelector('.ag-upd').addEventListener('click', () => updateSnapshot(s));
+      row.querySelector('.ag-rev').addEventListener('click', async () => {
+        if (externOnly.has(s.id)) {
+          toast('This snapshot requires the exported JSON. Select Import JSON to load it first.', 3200);
+          if (confirm('Import JSON for snapshot "' + s.name + '"?')) {
+            await importBackup();
+          }
+          return;
+        }
+        const msg = 'WARNING: EVERYTHING (NEW) SINCE THE SNAPSHOT WILL BE GONE\n\nSnapshot: "' + s.name + '" (' + new Date(s.ts).toLocaleString() + ')\n\nAre you sure you want to REVERT to this snapshot?';
+        if (confirm(msg)) revert(s);
+      });
+      row.querySelector('.ag-upd').addEventListener('click', () => {
+        if (externOnly.has(s.id)) {
+          toast('This snapshot is external. Updating will export a new JSON.', 2200);
+        }
+        if (confirm('WARNING: This will OVERWRITE the snapshot with current blocks.\n\nContinue?')) updateSnapshot(s);
+      });
       row.querySelector('.ag-ren').addEventListener('click', () => {
         const n = prompt('Snapshot name:', s.name);
         if (n != null) { s.name = n.trim() || s.name; saveStore(); render(); }
       });
       row.querySelector('.ag-del').addEventListener('click', () => {
-        if (!confirm('Delete snapshot "' + s.name + '"?')) return;
+        if (!confirm('WARNING: Delete snapshot "' + s.name + '" permanently?\n\n(This cannot be undone unless you have an exported JSON backup.)')) return;
         store.snaps = store.snaps.filter((x) => x.id !== s.id);
         memoryOnly.delete(s.id);
+        externOnly.delete(s.id);
         saveStore();
+        try { const stubs = store.snaps.filter(x=>externOnly.has(x.id)).map(x=>({id:x.id,name:x.name,ts:x.ts,ox:x.ox,oy:x.oy,oz:x.oz,sx:x.sx,sy:x.sy,sz:x.sz,count:x.count})); saveExtern(Array.from(externOnly), stubs); } catch(e){}
         render();
       });
+      if (row.querySelector('.ag-exp')) row.querySelector('.ag-exp').addEventListener('click', () => exportSnapshot(s));
       host.appendChild(row);
     }
   }
@@ -995,7 +1057,8 @@
         </div>
         <div class="ag-sec">
           <div class="ag-h">Snapshots <span id="ag-count" class="ag-badge">0</span></div>
-          <div id="ag-list"></div>
+          <div class="ag-row"><button id="ag-new">+ New Snapshot</button></div>
+          <div id="ag-list" class="ag-list"></div>
         </div>
         <div class="ag-sec">
           <div class="ag-h">Options</div>
@@ -1005,6 +1068,7 @@
           <label class="ag-check"><input type="checkbox" id="ag-support" checked> Auto-support floating blocks (scaffold)</label>
           <div class="ag-row"><span class="ag-lbl">Speed</span><input id="ag-speed" type="number" value="20" min="1" max="2000" step="1"><span class="ag-hint">blocks/s</span></div>
           <div class="ag-row"><span class="ag-lbl">Max region</span><input id="ag-maxv" type="number" value="8000000" min="10000" max="100000000" step="100000"><span class="ag-hint">cells</span></div>
+          <div class="ag-row"><button id="ag-exportall">Export All JSON</button><button id="ag-import">Import JSON</button></div>
         </div>
         <div id="ag-progress"><div id="ag-progress-bar"></div></div>
         <div id="ag-status" class="ag-status ag-idle">Idle</div>
@@ -1014,6 +1078,7 @@
 
     el('ag-scan').addEventListener('click', doScan);
     el('ag-clear').addEventListener('click', () => { pts[0] = pts[1] = pts[2] = pts[3] = null; render(); });
+    if (el('ag-new')) el('ag-new').addEventListener('click', () => doScan());
     el('ag-cancel').addEventListener('click', () => {
       scanCancel = true;
       if (job) { job.abort = true; job.i = job.n; }
@@ -1031,6 +1096,8 @@
       renderDims();
     });
     el('ag-height').addEventListener('change', render);
+    if (el('ag-exportall')) el('ag-exportall').addEventListener('click', exportBackupAll);
+    if (el('ag-import')) el('ag-import').addEventListener('click', importBackup);
     el('ag-collapse').addEventListener('click', () => {
       const body = el('ag-body');
       const hidden = body.style.display === 'none';
@@ -1118,6 +1185,17 @@
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
+
+  async function exportBackupAll() {
+    const d = serializable();
+    const blob = new Blob([JSON.stringify(d, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const tsn = new Date().toISOString().replace(/[:.]/g, "-");
+    a.href = url; a.download = `antigrief-all-${tsn}.json`; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    toast("All snapshots exported", 2000);
+  }
   function exportSnapshot(s) {
     const d = { snaps: [{ id: s.id, name: s.name, ts: s.ts, ox: s.ox, oy: s.oy, oz: s.oz, sx: s.sx, sy: s.sy, sz: s.sz, count: s.count, enc: s.enc }] };
     const blob = new Blob([JSON.stringify(d, null, 2)], { type: "application/json" });
