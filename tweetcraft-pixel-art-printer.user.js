@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         TweetCraft Pixel Art Printer
 // @namespace    https://tweetcraft.jai.vin
-// @version      1.8.4
+// @version      1.8.5
 // @description  Upload an image → auto-convert to wool colors → print pixel art like a bot (moves left→right, places blocks, fixes missed blocks per line)
-// @author       @vibecodingonsol
+// @author       @vibecodingonsol and @andrestube123
 // @match        https://tweetcraft.jai.vin/r/*
 // @match        https://tweetcraft.jai.vin/play/*
 // @grant        unsafeWindow
@@ -359,6 +359,94 @@
   /* ─────────────────────────────────────────────
    * 2. LOW-LEVEL ENGINE & NETWORK DISPATCH
    * ───────────────────────────────────────────── */
+  // ── Build protocol (ported from the known-good TweetCraft WorldEdit) ──
+  // Every accepted edit happens within ~6 blocks of the player, so before each
+  // op we park a spoofed position right next to the block (flying flag = 2, so
+  // gravity never drags the spoofer down mid-build). A place names the exact
+  // destination in `p`; the position/face (`x,y,z,f`) only says which solid
+  // neighbour it is attached to. The real hotbar + position are restored once a
+  // job finishes.
+  const FACE_N = [[0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]];
+  const SUPPORT_ORDER = [1, 4, 5, 2, 3, 0]; // below, sides, above
+  let opSeq = 0;
+  const heldOp = { held: -1, realBar: null, realSlot: 0 };
+
+  function readHotbar() {
+    const mc = targetWindow.__mc || window.__mc;
+    if (mc && mc.S && Array.isArray(mc.S.hotbar) && mc.S.hotbar.length === 9) return mc.S.hotbar.slice();
+    try {
+      const h = JSON.parse(localStorage.getItem('mc.hotbar'));
+      if (Array.isArray(h) && h.length === 9) return h;
+    } catch (e) { /* ignore */ }
+    if (lastSinv && Array.isArray(lastSinv.s) && lastSinv.s.length === 9) {
+      return lastSinv.s.map((e) => (e && Number.isInteger(e[0]) ? e[0] : 0));
+    }
+    return new Array(9).fill(0);
+  }
+  function readSlot() {
+    const mc = targetWindow.__mc || window.__mc;
+    if (mc && mc.S && Number.isInteger(mc.S.slot)) return mc.S.slot;
+    if (lastSinv && Number.isInteger(lastSinv.sel)) return lastSinv.sel;
+    return 0;
+  }
+  // Put `id` in slot 0 while preserving the rest of the real hotbar, so we can
+  // put the player's inventory back afterwards (the old code wiped all 9 slots).
+  function setHeldBlock(id) {
+    const ws = capturedWS;
+    if (!ws || ws.readyState !== 1) return;
+    if (heldOp.held === id) return;
+    if (heldOp.held === -1) {
+      heldOp.realBar = readHotbar();
+      heldOp.realSlot = readSlot();
+    }
+    heldOp.held = id;
+    const hb = heldOp.realBar.slice();
+    hb[0] = id;
+    ws.send(JSON.stringify({ t: 'inv', hotbar: hb, slot: 0 }));
+    lastSinv = null;
+    lastSelSlot = 0;
+  }
+  function restoreHeld() {
+    if (heldOp.held === -1) return;
+    heldOp.held = -1;
+    const hb = heldOp.realBar;
+    heldOp.realBar = null;
+    const ws = capturedWS;
+    if (!hb || !ws || ws.readyState !== 1) return;
+    try { ws.send(JSON.stringify({ t: 'inv', hotbar: hb, slot: heldOp.realSlot || 0 })); } catch (e) { /* ignore */ }
+  }
+  // 18-byte POS frame (type 1) parking the player at (x,y,z) with the flying
+  // flag set, exactly like the game streams when in flight.
+  function buildSpoofPos(x, y, z) {
+    const buf = new ArrayBuffer(18);
+    const dv = new DataView(buf);
+    dv.setUint8(0, 1);
+    dv.setFloat32(1, x, true);
+    dv.setFloat32(5, y, true);
+    dv.setFloat32(9, z, true);
+    dv.setInt16(13, 0, true);
+    dv.setInt16(15, 0, true);
+    dv.setUint8(17, 2);
+    return buf;
+  }
+  function sendRealPos() {
+    const ws = capturedWS;
+    const st = getPlayerState();
+    if (!ws || ws.readyState !== 1 || !st) return;
+    const buf = new ArrayBuffer(18);
+    const dv = new DataView(buf);
+    dv.setUint8(0, 1);
+    dv.setFloat32(1, st[0], true);
+    dv.setFloat32(5, st[1], true);
+    dv.setFloat32(9, st[2], true);
+    dv.setInt16(13, 0, true);
+    dv.setInt16(15, 0, true);
+    dv.setUint8(17, 0);
+    targetWindow.__pixelArtSending = true;
+    try { ws.send(buf); } catch (e) { /* ignore */ }
+    targetWindow.__pixelArtSending = false;
+  }
+
   function sendEditPacket(x, y, z, blockId) {
     const ws = capturedWS;
     if (!ws) {
@@ -383,24 +471,13 @@
       return false;
     }
 
-    // The game (survival-style build rooms) places a block via:
-    //   1) {"t":"inv","hotbar":[9 block ids],"slot":n}  -> tells the server what we hold
-    //   2) {"t":"place","x","y","z","f"}                -> places held block against face f of block (x,y,z)
-    // window.__mc only exists in DEV, so we replicate the exact wire messages ourselves.
-    const FACES = [[0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]];
-
     targetWindow.__pixelArtSending = true;
     try {
       if (blockId === 0) {
-        // Clearing a block: the server removes blocks via the dig flow. The game
-        // uses a UNIQUE incrementing sequence `i` per dig (++digSeq) to correlate
-        // the start/done stages; reusing one value makes the server ignore later
-        // digs as stale, which is why some support blocks survived cleanup.
-        const seq = ++digSeqCounter;
-        ws.send(JSON.stringify({ t: 'inv', hotbar: [0, 0, 0, 0, 0, 0, 0, 0, 0], slot: 0 }));
-        ws.send(buildPosPacket(ix + 0.5, iy + 0.5, iz + 0.5));
-        ws.send(JSON.stringify({ t: 'dig', s: 0, x: ix, y: iy, z: iz, f: 1, i: seq }));
-        ws.send(JSON.stringify({ t: 'dig', s: 2, x: ix, y: iy, z: iz, f: 1, i: seq }));
+        // Clearing: a single one-stage dig with the player parked above the block.
+        opSeq++;
+        ws.send(buildSpoofPos(ix + 0.5, Math.min(127, iy + 3), iz + 0.5));
+        ws.send(JSON.stringify({ t: 'dig', s: 0, x: ix, y: iy, z: iz, f: 1, i: opSeq }));
         sentEdits.set(editKey(ix, iy, iz), 0);
         packetsSentCount++;
         return true;
@@ -408,43 +485,20 @@
 
       // Pick a solid neighbour so we have a valid face to place against.
       let nx = ix, ny = iy, nz = iz, face = 1, found = false;
-      for (let fi = 0; fi < 6; fi++) {
-        const d = FACES[fi];
+      for (const f of SUPPORT_ORDER) {
+        const d = FACE_N[f];
         const cx = ix - d[0], cy = iy - d[1], cz = iz - d[2];
         if (cy < 0 || cy >= 128) continue;
         const b = getBlock(cx, cy, cz);
-        if (b > 0 && b !== 255) { nx = cx; ny = cy; nz = cz; face = fi; found = true; break; }
-      }
-      if (!found) {
-        // No solid neighbour: try to place directly (server may still accept it).
-        nx = ix; ny = iy; nz = iz; face = 1;
+        if (b > 0 && b !== 255) { nx = cx; ny = cy; nz = cz; face = f; found = true; break; }
       }
 
-      // Choose which inventory slot holds this block. The server is authoritative
-      // about the hotbar (survival rooms ignore client-setSlot), so prefer a slot
-      // that already contains the block; otherwise fabricate a hotbar via `inv`.
-      let slot = -1;
-      if (lastSinv && Array.isArray(lastSinv.s)) {
-        for (let i = 0; i < 9; i++) {
-          const entry = lastSinv.s[i];
-          if (entry && entry[0] === blockId) { slot = i; break; }
-        }
-      }
-      if (slot === -1) {
-        slot = 0;
-        ws.send(JSON.stringify({ t: 'inv', hotbar: [blockId, blockId, blockId, blockId, blockId, blockId, blockId, blockId, blockId], slot: 0 }));
-        // `inv` already carries the selected slot, so no separate `sel` is needed.
-        lastSelSlot = slot;
-        lastSinv = null;
-      }
-      if (lastSelSlot !== slot) {
-        ws.send(JSON.stringify({ t: 'sel', i: slot }));
-        lastSelSlot = slot;
-      }
-      ws.send(buildPosPacket(nx + 0.5, ny + 0.5, nz + 0.5));
-      ws.send(JSON.stringify({ t: 'place', x: nx, y: ny, z: nz, f: face }));
+      opSeq++;
+      setHeldBlock(blockId);
+      ws.send(buildSpoofPos(nx + 0.5, Math.min(127, ny + 3), nz + 0.5));
+      ws.send(JSON.stringify({ t: 'place', x: nx, y: ny, z: nz, f: face, i: opSeq, p: [ix, iy, iz] }));
       sentEdits.set(editKey(ix, iy, iz), blockId);
-      console.log('[PIXEL-DEBUG] US place block', blockId, 'slot', slot, 'target', ix, iy, iz, 'against', nx, ny, nz, 'face', face, found ? '(solid nbr)' : '(no nbr)');
+      console.log('[PIXEL-DEBUG] US place block', blockId, 'target', ix, iy, iz, 'against', nx, ny, nz, 'face', face, found ? '(solid nbr)' : '(no nbr)');
       packetsSentCount++;
       return true;
     } catch (e) {
@@ -456,19 +510,17 @@
   }
 
   // Mine out the block currently at (x,y,z) so a different block can be placed
-  // there. Sends the game's dig flow (start + done) and waits briefly for the
-  // server to process it before the caller places the new block.
+  // there. Sends a single one-stage dig (like the game's creative break) with
+  // the player parked above the block.
   async function clearCell(x, y, z) {
     if (!capturedWS || capturedWS.readyState !== 1) return;
     const mc = targetWindow.__mc || window.__mc;
-    const seq = ++digSeqCounter;
+    opSeq++;
     console.log(`[PixelArt] Pre-clearing existing block at (${x}, ${y}, ${z})`);
     targetWindow.__pixelArtSending = true;
     try {
-      capturedWS.send(JSON.stringify({ t: 'inv', hotbar: [0, 0, 0, 0, 0, 0, 0, 0, 0], slot: 0 }));
-      capturedWS.send(buildPosPacket(x + 0.5, y + 0.5, z + 0.5));
-      capturedWS.send(JSON.stringify({ t: 'dig', s: 0, x, y, z, f: 1, i: seq }));
-      capturedWS.send(JSON.stringify({ t: 'dig', s: 2, x, y, z, f: 1, i: seq }));
+      capturedWS.send(buildSpoofPos(x + 0.5, Math.min(127, y + 3), z + 0.5));
+      capturedWS.send(JSON.stringify({ t: 'dig', s: 0, x, y, z, f: 1, i: opSeq }));
     } catch (e) {
       console.warn('[PixelArt] Pre-clear dig failed:', e);
     }
@@ -476,7 +528,7 @@
     sentEdits.set(editKey(x, y, z), 0);
     if (mc && mc.eng && mc.eng.x) mc.eng.x.set_block(x, y, z, 0);
     else if (wasmExports && typeof wasmExports.set_block === 'function') wasmExports.set_block(x, y, z, 0);
-    await new Promise((r) => setTimeout(r, 120));
+    await new Promise((r) => setTimeout(r, 60));
   }
 
   async function placeBlock(x, y, z, blockId) {
@@ -1020,7 +1072,7 @@
       this.movePlayer = true;
       this.standoff = 2.5;
       this.delayMs = 45;
-      this.lineRetries = 30;
+      this.lineRetries = 1;
       this.progress = { row: 0, col: 0, placed: 0, total: 0, status: '' };
       this.onProgress = null;
       this._cancel = false;
@@ -1149,20 +1201,18 @@
       this.progress.status = `Removing ${pads.length} support block(s)…`;
       this._notify();
       const ordered = [...pads].sort((a, b) => b.y - a.y); // top-down
-      // Digs are rate-limited (~200ms) more aggressively than placements, and we
-      // get no acks, so use a slower cadence and run two passes to catch drops.
-      const digDelay = Math.max(this.delayMs, 200);
-      for (let pass = 0; pass < 2 && !this._cancel; pass++) {
-        for (const p of ordered) {
-          await this._waitUnpaused();
-          if (this._cancel) return;
-          if (this.movePlayer) {
-            const pp = this._playerPosForBlock(p.x, p.y, p.z);
-            movePlayer(pp.x, pp.y, pp.z);
-          }
-          await placeBlock(p.x, p.y, p.z, 0);
-          await this._sleep(digDelay);
+      // Same cadence as a normal clean-up: a single pass is enough, blocks that
+      // are already air are skipped.
+      for (const p of ordered) {
+        await this._waitUnpaused();
+        if (this._cancel) return;
+        if (getBlock(p.x, p.y, p.z) === 0) continue;
+        if (this.movePlayer) {
+          const pp = this._playerPosForBlock(p.x, p.y, p.z);
+          movePlayer(pp.x, pp.y, pp.z);
         }
+        await placeBlock(p.x, p.y, p.z, 0);
+        await this._sleep(this.delayMs);
       }
       this._scaffoldPlaced = [];
     }
@@ -1202,10 +1252,12 @@
           : '✅ Printing complete! All blocks sent to server.';
         this._notify();
       }
+      restoreHeld();
+      sendRealPos();
       this.running = false;
     }
 
-    async clearArea(w, h, origin, direction, delayMs = 50, retries = 30, followPlayer = false) {
+    async clearArea(w, h, origin, direction, delayMs = 50, retries = 1, followPlayer = false) {
       this.w = w;
       this.h = h;
       this.origin = origin;
@@ -1294,6 +1346,8 @@
       this.running = false;
       this.progress.status = this._cancel ? '⛔ Stopped' : '✅ Area cleared!';
       this._notify();
+      restoreHeld();
+      sendRealPos();
     }
 
     async _printAll() {
@@ -1868,8 +1922,8 @@
 
       <div id="pa-header">
         <div class="title-wrap">
-          <div class="title"><span>🖨️</span> Pixel Art Printer <span style="font-size:10px; color:#c084fc; background:rgba(147,51,234,0.3); padding:2px 6px; border-radius:10px;">v1.8.1</span></div>
-          <div class="byline">by @vibecodingonsol</div>
+          <div class="title"><span>🖨️</span> Pixel Art Printer <span style="font-size:10px; color:#c084fc; background:rgba(147,51,234,0.3); padding:2px 6px; border-radius:10px;">v1.8.5</span></div>
+          <div class="byline">by @vibecodingonsol and @andrestube123</div>
         </div>
         <button id="pa-toggle-btn">▾</button>
       </div>
@@ -1919,7 +1973,7 @@
           <div class="pa-note">⚠️ Default is 45 ms. Very low values may cause the server to silently drop blocks (results vary with server load).</div>
           <div class="pa-row">
             <label>Line Retries</label>
-            <input type="number" id="pa-retries" value="30" min="1" max="60" step="1" title="Sweeps to fix missed/leftover blocks before moving to the next line (used for both building and cleaning)">
+            <input type="number" id="pa-retries" value="1" min="1" max="60" step="1" title="Sweeps to fix missed/leftover blocks before moving to the next line (used for both building and cleaning)">
           </div>
           <div class="pa-row">
             <label>Facing / Wall</label>
@@ -2303,7 +2357,7 @@
       const origin = getOrigin();
       const dir = panel.querySelector('#pa-dir').value;
       const delay = parseInt(panel.querySelector('#pa-delay').value) || 45;
-      const retries = parseInt(panel.querySelector('#pa-retries').value) || 30;
+      const retries = parseInt(panel.querySelector('#pa-retries').value) || 1;
       const mode = panel.querySelector('#pa-mode').value;
       const movePlayerOpt = panel.querySelector('#pa-move-player').checked;
       const scaffoldOpt = panel.querySelector('#pa-scaffold').checked;
@@ -2422,7 +2476,7 @@
       if (!confirm(`Quick-clean "${art.name}" (${art.w}×${art.h}) at (${art.origin.x}, ${art.origin.y}, ${art.origin.z})?`)) return;
 
       const delay = parseInt(panel.querySelector('#pa-delay').value) || 45;
-      const retries = parseInt(panel.querySelector('#pa-retries').value) || 30;
+      const retries = parseInt(panel.querySelector('#pa-retries').value) || 1;
       const followPlayer = panel.querySelector('#pa-move-player').checked;
       switchTab('printer');
       await runClearAt(art.w, art.h, art.origin, art.direction, delay, retries, followPlayer);
@@ -2462,7 +2516,7 @@
       const origin = getOrigin();
       const dir = panel.querySelector('#pa-dir').value;
       const delay = parseInt(panel.querySelector('#pa-delay').value) || 45;
-      const retries = parseInt(panel.querySelector('#pa-retries').value) || 30;
+      const retries = parseInt(panel.querySelector('#pa-retries').value) || 1;
       const followPlayer = panel.querySelector('#pa-move-player').checked;
 
       await runClearAt(currentW, currentH, origin, dir, delay, retries, followPlayer);
