@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TweetCraft 3D Model Printer
 // @namespace    https://tweetcraft.jai.vin
-// @version      1.5.1
+// @version      1.5.2
 // @description  Upload a 3D model (OBJ/MTL, STL, GLB or FBX) → voxelize it → print it into your TweetCraft world as real blocks. Respects the 128-block max build height.
 // @author       @vibecodingonsol and @andrestube123
 // @match        https://tweetcraft.jai.vin/r/*
@@ -1236,7 +1236,7 @@
     constructor() {
       this.running = false;
       this.paused = false;
-      this.delayMs = 45;
+      this.delayMs = 50;
       this.retries = 1;
       this.movePlayer = true;
       this.standoff = 3;
@@ -1708,7 +1708,7 @@
 
       <div id="m3d-header">
         <div>
-          <div class="title"><span>🧊</span> 3D Model Printer <span style="font-size:10px; color:#5eead4; background:rgba(20,184,166,0.25); padding:2px 6px; border-radius:10px;">v1.5.1</span></div>
+          <div class="title"><span>🧊</span> 3D Model Printer <span style="font-size:10px; color:#5eead4; background:rgba(20,184,166,0.25); padding:2px 6px; border-radius:10px;">v1.5.2</span></div>
           <div class="byline">by @vibecodingonsol and @andrestube123</div>
         </div>
         <button id="m3d-toggle-btn">▾</button>
@@ -1772,9 +1772,9 @@
           </div>
           <div class="m3d-row">
             <label>Delay (ms)</label>
-            <input type="number" id="m3d-delay" value="45" min="10" max="2000" step="5" title="45 ms default — lower values may cause the server to drop blocks">
+            <input type="number" id="m3d-delay" value="50" min="10" max="2000" step="5" title="50 ms default — lower values may cause the server to drop blocks">
           </div>
-          <div style="font-size:10px; color:#fbbf24; line-height:1.35; margin:-4px 0 8px; padding-left:92px;">⚠️ Default is 45 ms. Very low values may cause the server to silently drop blocks (results vary with server load).</div>
+          <div style="font-size:10px; color:#fbbf24; line-height:1.35; margin:-4px 0 8px; padding-left:92px;">⚠️ Default is 50 ms. Very low values may cause the server to silently drop blocks (results vary with server load).</div>
           <div class="m3d-row">
             <label>Layer Retries</label>
             <input type="number" id="m3d-retries" value="1" min="1" max="60" step="1">
@@ -2167,7 +2167,7 @@
     const cleanModel = async (m) => {
       if (printer.running) { alert('Printer is busy. Stop the current job first.'); return; }
       if (!confirm(`Quick-clean "${m.name}" (${m.dx}×${m.dy}×${m.dz}) at (${m.origin.x}, ${m.origin.y}, ${m.origin.z})?`)) return;
-      const delay = parseInt(panel.querySelector('#m3d-delay').value) || 45;
+      const delay = parseInt(panel.querySelector('#m3d-delay').value) || 50;
       const move = panel.querySelector('#m3d-move').checked;
       if (m.origin.y < 1 || m.origin.y + m.dy > WORLD_MAX_Y) { alert('Origin Y would exceed the world height. Adjust the origin first.'); return; }
       switchTab('printer');
@@ -2196,7 +2196,7 @@
       }
 
       const mode = colorModeSel.value;
-      const delay = parseInt(panel.querySelector('#m3d-delay').value) || 45;
+      const delay = parseInt(panel.querySelector('#m3d-delay').value) || 50;
       const retries = parseInt(panel.querySelector('#m3d-retries').value) || 1;
       const move = panel.querySelector('#m3d-move').checked;
       const scaffold = panel.querySelector('#m3d-scaffold').checked;
@@ -2307,7 +2307,7 @@
         alert('Origin Y would exceed the world height. Adjust the origin first.');
         return;
       }
-      const delay = parseInt(panel.querySelector('#m3d-delay').value) || 45;
+      const delay = parseInt(panel.querySelector('#m3d-delay').value) || 50;
       const move = panel.querySelector('#m3d-move').checked;
       startBtn.style.display = 'none';
       stopBtn.style.display = '';
